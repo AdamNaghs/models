@@ -42,9 +42,9 @@ enc = lambda s: torch.tensor([stoi[c] for c in s if c in stoi], dtype=torch.long
 dec = lambda t: "".join(itos[i] for i in t.tolist())
 data = enc(text).to(device)
 
-B, T = 32, 128
+B, T = 32, 256
 V = len(chars)
-N, H, L = 192, 4, 4
+N, H, L = 256, 8, 6
 
 
 def batch(split=0.9):
@@ -103,7 +103,7 @@ class TinyLM(nn.Module):
 m = TinyLM().to(device)
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 
-for step in range(1400):
+for step in range(4500):
     x, y = batch()
     _, loss = m(x, y)
     opt.zero_grad(set_to_none=True)
