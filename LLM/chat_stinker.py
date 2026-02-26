@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-ckpt = torch.load("repos/models/LLM/stinker.ckpt", map_location=device)
+ckpt = torch.load("stinker.ckpt", map_location=device)
 
 stoi, itos = ckpt["stoi"], ckpt["itos"]
 T = ckpt["config"]["T"]
