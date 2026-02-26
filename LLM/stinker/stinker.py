@@ -5,6 +5,8 @@ import torch.nn.functional as F
 
 torch.manual_seed(0)
 device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    torch.set_float32_matmul_precision("high")
 
 USER_TAG = "<|user|>"
 ASSIST_TAG = "<|assistant|>"
@@ -101,14 +103,34 @@ class TinyLM(nn.Module):
 
 
 m = TinyLM().to(device)
+if device == "cuda":
+    try:
+        print("Compiling model")
+        m = torch.compile(m)
+    except Exception:
+        print("Failed to compile model with cuda.")
+        pass
+
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
+scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
+
+print(
+    "device:",
+    device,
+    "| cuda:",
+    torch.cuda.is_available(),
+    "|",
+    torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+)
 
 for step in range(4500):
     x, y = batch()
-    _, loss = m(x, y)
     opt.zero_grad(set_to_none=True)
-    loss.backward()
-    opt.step()
+    with torch.amp.autocast("cuda", enabled=(device == "cuda")):
+        _, loss = m(x, y)
+    scaler.scale(loss).backward()
+    scaler.step(opt)
+    scaler.update()
     if step % 200 == 0:
         print(f"step {step:4d} | loss {loss.item():.3f}")
 
