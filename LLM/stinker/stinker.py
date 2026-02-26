@@ -103,7 +103,7 @@ class TinyLM(nn.Module):
 
 
 m = TinyLM().to(device)
-if device == "cuda":
+if device == "cuda" and torch.cuda.is_available() and __import__("platform").system() != "Windows":
     try:
         print("Compiling model")
         m = torch.compile(m)
@@ -111,7 +111,7 @@ if device == "cuda":
         print("Failed to compile model with cuda.")
         pass
 else:
-    print("Non cuda")
+    print("Skipping compile (cpu or windows)")
 
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
