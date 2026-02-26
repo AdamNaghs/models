@@ -15,7 +15,18 @@ from datasets import load_dataset
 
 def parse_args():
     p = argparse.ArgumentParser(description="Full-streaming GPT trainer on FineWeb-Edu")
-    p.add_argument("--config", default="CC-MAIN-2013-48", choices=["CC-MAIN-2013-48", "CC-MAIN-2013-20"])
+    p.add_argument(
+        "--config",
+        default="CC-MAIN-2025-26",
+        choices=[
+            "CC-MAIN-2025-05",
+            "CC-MAIN-2025-08",
+            "CC-MAIN-2025-13",
+            "CC-MAIN-2025-18",
+            "CC-MAIN-2025-21",
+            "CC-MAIN-2025-26",
+        ],
+    )
     p.add_argument("--train-steps", type=int, default=15000)
     p.add_argument("--batch-size", type=int, default=20)
     p.add_argument("--context", type=int, default=512)
