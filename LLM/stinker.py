@@ -39,7 +39,8 @@ class Block(nn.Module):
         self.ff = nn.Sequential(nn.Linear(N, 4 * N), nn.GELU(), nn.Linear(4 * N, N), nn.Dropout(0.1))
 
     def forward(self, x):
-        m = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        t = x.size(1)
+        m = torch.triu(torch.ones(t, t, device=x.device), diagonal=1).bool()
         x = x + self.attn(self.ln1(x), self.ln1(x), self.ln1(x), attn_mask=m, need_weights=False)[0]
         return x + self.ff(self.ln2(x))
 
