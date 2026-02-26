@@ -110,6 +110,8 @@ if device == "cuda":
     except Exception:
         print("Failed to compile model with cuda.")
         pass
+else:
+    print("Non cuda")
 
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
