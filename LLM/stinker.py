@@ -6,7 +6,7 @@ torch.manual_seed(0)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
-    with open("repos/models/LLM/data.txt", "r", encoding="utf-8") as f:
+    with open("data.txt", "r", encoding="utf-8") as f:
         text = f.read()
 except FileNotFoundError:
     text = "small llm demo in under 100 lines. " * 200
@@ -94,4 +94,4 @@ ckpt = {
 "config": {"B": B, "T": T, "N": N, "H": H, "L": L, "V": V},
 }
 torch.save(ckpt, "stinker.ckpt")
-print("saved -> repos/models/LLM/stinker.ckpt")
+print("saved -> stinker.ckpt")
