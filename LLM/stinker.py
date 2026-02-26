@@ -93,5 +93,5 @@ ckpt = {
 "itos": itos,
 "config": {"B": B, "T": T, "N": N, "H": H, "L": L, "V": V},
 }
-torch.save(ckpt, "repos/models/LLM/stinker.ckpt")
+torch.save(ckpt, "stinker.ckpt")
 print("saved -> repos/models/LLM/stinker.ckpt")
