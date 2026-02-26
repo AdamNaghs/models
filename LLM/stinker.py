@@ -84,3 +84,13 @@ for step in range(1200):
 start = torch.tensor([[stoi["s"]]], device=device)
 out = m.generate(start, n=300)
 print("\n--- sample ---\n" + dec(out[0].cpu()))
+
+# save
+ckpt = {
+"state_dict": m.state_dict(),
+"stoi": stoi,
+"itos": itos,
+"config": {"B": B, "T": T, "N": N, "H": H, "L": L, "V": V},
+}
+torch.save(ckpt, "repos/models/LLM/stinker.ckpt")
+print("saved -> repos/models/LLM/stinker.ckpt")
