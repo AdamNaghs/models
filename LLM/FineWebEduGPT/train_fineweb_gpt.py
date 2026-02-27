@@ -13,6 +13,52 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 
+PRESETS = {
+    "5080": {
+        "train_steps": 100000,
+        "batch_size": 8,
+        "context": 512,
+        "n_layer": 12,
+        "n_head": 10,
+        "n_embd": 640,
+        "grad_accum": 16,
+        "vocab_size": 16000,
+        "eval_every": 500,
+        "eval_iters": 12,
+        "ckpt_every": 2000,
+        "seed_docs": 50000,
+    },
+    "hpc": {
+        "train_steps": 200000,
+        "batch_size": 16,
+        "context": 2048,
+        "n_layer": 32,
+        "n_head": 32,
+        "n_embd": 4096,
+        "grad_accum": 8,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 200000,
+    },
+    "10b": {
+        "train_steps": 250000,
+        "batch_size": 8,
+        "context": 2048,
+        "n_layer": 40,
+        "n_head": 40,
+        "n_embd": 3840,
+        "grad_accum": 16,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 250000,
+    },
+}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Full-streaming GPT trainer on FineWeb-Edu")
     p.add_argument(
@@ -27,24 +73,54 @@ def parse_args():
             "CC-MAIN-2025-26",
         ],
     )
-    p.add_argument("--train-steps", type=int, default=15000)
-    p.add_argument("--batch-size", type=int, default=20)
+    p.add_argument("--train-steps", type=int, default=100000)
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--context", type=int, default=512)
-    p.add_argument("--n-layer", type=int, default=10)
-    p.add_argument("--n-head", type=int, default=8)
-    p.add_argument("--n-embd", type=int, default=512)
+    p.add_argument("--n-layer", type=int, default=12)
+    p.add_argument("--n-head", type=int, default=10)
+    p.add_argument("--n-embd", type=int, default=640)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--eval-every", type=int, default=200)
-    p.add_argument("--eval-iters", type=int, default=10)
-    p.add_argument("--ckpt-every", type=int, default=1000)
-    p.add_argument("--grad-accum", type=int, default=4)
-    p.add_argument("--vocab-size", type=int, default=8192)
+    p.add_argument("--eval-every", type=int, default=500)
+    p.add_argument("--eval-iters", type=int, default=12)
+    p.add_argument("--ckpt-every", type=int, default=2000)
+    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--vocab-size", type=int, default=16000)
     p.add_argument("--tokenizer-model", default="tokenizer.model")
     p.add_argument("--queue-size", type=int, default=64)
-    p.add_argument("--seed-docs", type=int, default=5000, help="Docs used once to build tokenizer if missing")
-    return p.parse_args()
+    p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
+    p.add_argument("--preset", choices=["5080", "hpc", "10b"], help="Apply a training preset")
+
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-5080", dest="preset_5080", action="store_true", help="Use RTX 5080-oriented preset")
+    g.add_argument("-HPC", dest="preset_hpc", action="store_true", help="Use large HPC preset")
+    g.add_argument("-10B", dest="preset_10b", action="store_true", help="Use 10B-target preset")
+
+    args = p.parse_args()
+
+    if args.preset_5080:
+        args.preset = "5080"
+    elif args.preset_hpc:
+        args.preset = "hpc"
+    elif args.preset_10b:
+        args.preset = "10b"
+
+    if args.preset:
+        for k, v in PRESETS[args.preset].items():
+            setattr(args, k, v)
+
+    return args
+
+
+def estimate_params(vocab, context, n_embd, n_layer):
+    # rough GPT estimate (embeddings + blocks + lm head)
+    return (
+        vocab * n_embd  # token embedding
+        + context * n_embd  # position embedding
+        + n_layer * (12 * n_embd * n_embd + 13 * n_embd)  # attention + MLP + norms
+        + n_embd * vocab  # lm head
+    )
 
 
 def ensure_tokenizer(args):
@@ -217,9 +293,10 @@ def main():
         return sum(vals) / len(vals)
 
     params = sum(p.numel() for p in model.parameters())
+    est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     print(
-        f"device={device} | vocab={vocab} | params={params:,} | config={args.config} | "
-        f"grad_accum={args.grad_accum} | full-streaming=yes"
+        f"device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
+        f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | full-streaming=yes"
     )
 
     ckpt_path = "fineweb_gpt.ckpt"
