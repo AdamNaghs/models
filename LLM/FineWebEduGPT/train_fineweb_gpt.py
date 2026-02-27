@@ -377,26 +377,37 @@ def main():
         except Exception:
             pass
 
-    try:
-        opt = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            betas=(0.9, 0.95),
-            weight_decay=args.weight_decay,
-            fused=(device == "cuda"),
-            foreach=True,
-        )
-    except TypeError:
+    opt = None
+    if device == "cuda":
+        # PyTorch forbids fused=True and foreach=True together.
+        # Try fused first (usually fastest on CUDA), then foreach, then plain.
         try:
             opt = torch.optim.AdamW(
                 model.parameters(),
                 lr=args.lr,
                 betas=(0.9, 0.95),
                 weight_decay=args.weight_decay,
-                foreach=True,
+                fused=True,
             )
-        except TypeError:
-            opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+        except (TypeError, RuntimeError):
+            try:
+                opt = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=args.lr,
+                    betas=(0.9, 0.95),
+                    weight_decay=args.weight_decay,
+                    foreach=True,
+                )
+            except (TypeError, RuntimeError):
+                pass
+
+    if opt is None:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.95),
+            weight_decay=args.weight_decay,
+        )
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
