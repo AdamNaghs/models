@@ -113,9 +113,11 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--eval-every", type=int, default=500)
-    p.add_argument("--eval-iters", type=int, default=12)
+    p.add_argument("--eval-iters", type=int, default=100)
     p.add_argument("--ckpt-every", type=int, default=2000)
     p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--min-lr", type=float, default=3e-5)
     p.add_argument("--vocab-size", type=int, default=16000)
     p.add_argument("--tokenizer-model", default="tokenizer.model")
     p.add_argument("--queue-size", type=int, default=64)
@@ -158,6 +160,8 @@ def parse_args():
         "eval_iters": {"--eval-iters"},
         "ckpt_every": {"--ckpt-every"},
         "grad_accum": {"--grad-accum"},
+        "warmup_steps": {"--warmup-steps"},
+        "min_lr": {"--min-lr"},
         "vocab_size": {"--vocab-size"},
         "tokenizer_model": {"--tokenizer-model"},
         "queue_size": {"--queue-size"},
@@ -260,6 +264,7 @@ class GPT(nn.Module):
 class StreamingBatcher:
     def __init__(self, sp, config, context, batch_size, queue_size=64):
         self.sp = sp
+        self.eos_id = sp.eos_id()
         self.context = context
         self.batch_size = batch_size
         self.q = queue.Queue(maxsize=queue_size)
@@ -278,7 +283,9 @@ class StreamingBatcher:
             if not txt:
                 continue
             ids = self.sp.encode(txt, out_type=int)
-            token_buf.extend(ids)
+            if ids:
+                token_buf.extend(ids)
+                token_buf.append(self.eos_id)
 
             needed = self.batch_size * (self.context + 1)
             while len(token_buf) >= needed and not self.stop.is_set():
@@ -339,6 +346,14 @@ def main():
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
+    def get_lr(step):
+        if step < args.warmup_steps:
+            return args.lr * (step + 1) / max(args.warmup_steps, 1)
+        progress = (step - args.warmup_steps) / max(args.train_steps - args.warmup_steps, 1)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr + cosine * (args.lr - args.min_lr)
+
     @torch.no_grad()
     def eval_loss(iters):
         model.eval()
@@ -373,12 +388,16 @@ def main():
                 eval_start = time.perf_counter()
                 v = eval_loss(args.eval_iters)
                 eval_dt = time.perf_counter() - eval_start
+                cur_lr = opt.param_groups[0]["lr"]
                 print(
                     f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
-                    f"dt {last_step_dt:.2f}s | eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
+                    f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                 )
 
             step_start = time.perf_counter()
+            cur_lr = get_lr(step)
+            for pg in opt.param_groups:
+                pg["lr"] = cur_lr
             opt.zero_grad(set_to_none=True)
             for _ in range(args.grad_accum):
                 xb, yb = train_stream.next(device)
@@ -387,6 +406,8 @@ def main():
                     loss = loss / args.grad_accum
                 scaler.scale(loss).backward()
 
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             last_step_dt = time.perf_counter() - step_start
