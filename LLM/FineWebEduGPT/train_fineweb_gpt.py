@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import math
+import os
 import platform
 import queue
 import sys
@@ -352,11 +353,18 @@ class StreamingBatcher:
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    else:
+        device = "cpu"
 
     sp = ensure_tokenizer(args)
     vocab = sp.vocab_size()
@@ -437,7 +445,7 @@ def main():
     params = sum(p.numel() for p in model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     print(
-        f"device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
+        f"rank={local_rank}/{world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
         f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} | full-streaming=yes"
     )
 
