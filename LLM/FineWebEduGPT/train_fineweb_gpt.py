@@ -346,7 +346,7 @@ def main():
             avg_step = elapsed / max(step, 1)
             eta = max(args.train_steps - step, 0) * avg_step
 
-            if step % args.eval_every == 0:
+            if step == 1 or step % args.eval_every == 0:
                 v = eval_loss(args.eval_iters)
                 print(
                     f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
