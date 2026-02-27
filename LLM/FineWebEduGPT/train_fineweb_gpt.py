@@ -11,8 +11,10 @@ from collections import deque
 
 import sentencepiece as spm
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from datasets import load_dataset
 
 
@@ -295,7 +297,7 @@ class GPT(nn.Module):
 
 
 class StreamingBatcher:
-    def __init__(self, sp, config, context, batch_size, queue_size=64, num_workers=2):
+    def __init__(self, sp, config, context, batch_size, queue_size=64, num_workers=2, rank=0, world_size=1):
         self.sp = sp
         self.eos_id = sp.eos_id()
         self.context = context
@@ -303,6 +305,8 @@ class StreamingBatcher:
         self.q = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
         self.config = config
+        self.rank = rank
+        self.world_size = max(1, world_size)
         self.num_workers = max(1, num_workers)
         self.workers = []
         for _ in range(self.num_workers):
@@ -312,6 +316,8 @@ class StreamingBatcher:
 
     def _run(self):
         ds = load_dataset("HuggingFaceFW/fineweb-edu", self.config, split="train", streaming=True)
+        if self.world_size > 1:
+            ds = itertools.islice(ds, self.rank, None, self.world_size)
         token_buf = deque()
         for ex in ds:
             if self.stop.is_set():
@@ -339,7 +345,7 @@ class StreamingBatcher:
 
     def next(self, device):
         x, y = self.q.get(timeout=120)
-        if device == "cuda":
+        if str(device).startswith("cuda"):
             x = x.pin_memory().to(device, non_blocking=True)
             y = y.pin_memory().to(device, non_blocking=True)
         else:
@@ -356,6 +362,8 @@ def main():
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    is_distributed = world_size > 1
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -366,31 +374,44 @@ def main():
     else:
         device = "cpu"
 
+    if is_distributed:
+        backend = "nccl" if str(device).startswith("cuda") else "gloo"
+        dist.init_process_group(backend=backend)
+
+    is_main = (rank == 0)
+
     sp = ensure_tokenizer(args)
     vocab = sp.vocab_size()
 
     train_stream = StreamingBatcher(
         sp, args.config, args.context, args.batch_size,
-        queue_size=args.queue_size, num_workers=args.num_workers
+        queue_size=args.queue_size, num_workers=args.num_workers,
+        rank=rank, world_size=world_size,
     )
     val_stream = StreamingBatcher(
         sp, args.config, args.context, args.batch_size,
-        queue_size=max(16, args.queue_size // 2), num_workers=max(1, args.num_workers // 2)
+        queue_size=max(16, args.queue_size // 2), num_workers=max(1, args.num_workers // 2),
+        rank=rank, world_size=world_size,
     )
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
-    if device == "cuda" and platform.system() != "Windows":
+    if str(device).startswith("cuda") and platform.system() != "Windows" and not is_distributed:
         try:
             model = torch.compile(model)
         except Exception:
             pass
 
+    if is_distributed:
+        ddp_device_ids = [local_rank] if str(device).startswith("cuda") else None
+        model = DDP(model, device_ids=ddp_device_ids)
+
     opt = None
-    if device == "cuda":
+    if str(device).startswith("cuda"):
         # PyTorch forbids fused=True and foreach=True together.
         # Try fused first (usually fastest on CUDA), then foreach, then plain.
         try:
-            print("Optimizing with AdamW fused")
+            if is_main:
+                print("Optimizing with AdamW fused")
             opt = torch.optim.AdamW(
                 model.parameters(),
                 lr=args.lr,
@@ -399,7 +420,8 @@ def main():
                 fused=True,
             )
         except (TypeError, RuntimeError) as e:
-            print(f"Encountered Error '{e}', Falling back to AdamW foreach")
+            if is_main:
+                print(f"Encountered Error '{e}', Falling back to AdamW foreach")
             try:
                 opt = torch.optim.AdamW(
                     model.parameters(),
@@ -409,7 +431,8 @@ def main():
                     foreach=True,
                 )
             except (TypeError, RuntimeError):
-                print("AdamW optimization Failed")
+                if is_main:
+                    print("AdamW optimization Failed")
                 pass
 
     if opt is None:
@@ -420,7 +443,7 @@ def main():
             weight_decay=args.weight_decay,
         )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=str(device).startswith("cuda"))
 
     def get_lr(step):
         if step < args.warmup_steps:
@@ -436,18 +459,25 @@ def main():
         vals = []
         for _ in range(iters):
             xb, yb = val_stream.next(device)
-            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
+            with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
                 _, loss = model(xb, yb)
             vals.append(loss.item())
+        local_mean = sum(vals) / len(vals)
+        if is_distributed:
+            t = torch.tensor([local_mean], device=device, dtype=torch.float32)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            local_mean = (t / world_size).item()
         model.train()
-        return sum(vals) / len(vals)
+        return local_mean
 
-    params = sum(p.numel() for p in model.parameters())
+    raw_model = model.module if isinstance(model, DDP) else model
+    params = sum(p.numel() for p in raw_model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
-    print(
-        f"rank={local_rank}/{world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
-        f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} | full-streaming=yes"
-    )
+    if is_main:
+        print(
+            f"rank={local_rank}/{world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
+            f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} | full-streaming=yes"
+        )
 
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
@@ -467,11 +497,12 @@ def main():
                 eval_dt = time.perf_counter() - eval_start
                 cur_lr = opt.param_groups[0]["lr"]
                 toks_per_s = (tokens_per_step / last_step_dt) if last_step_dt > 0 else 0.0
-                print(
-                    f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
-                    f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
-                    f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
-                )
+                if is_main:
+                    print(
+                        f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
+                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
+                        f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
+                    )
 
             step_start = time.perf_counter()
             cur_lr = get_lr(step)
@@ -480,7 +511,7 @@ def main():
             opt.zero_grad(set_to_none=True)
             for _ in range(args.grad_accum):
                 xb, yb = train_stream.next(device)
-                with torch.amp.autocast("cuda", enabled=(device == "cuda")):
+                with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
                     _, loss = model(xb, yb)
                     loss = loss / args.grad_accum
                 scaler.scale(loss).backward()
@@ -491,17 +522,21 @@ def main():
             scaler.update()
             last_step_dt = time.perf_counter() - step_start
 
-            if step > 0 and step % args.ckpt_every == 0:
-                sd = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+            if step > 0 and step % args.ckpt_every == 0 and is_main:
+                sd = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
                 torch.save({"state_dict": sd, "args": vars(args), "vocab": vocab}, ckpt_path)
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
-        sd = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
-        torch.save({"state_dict": sd, "args": vars(args), "vocab": vocab}, ckpt_path)
-        print(f"saved -> {ckpt_path}")
+        if is_main:
+            sd = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
+            torch.save({"state_dict": sd, "args": vars(args), "vocab": vocab}, ckpt_path)
+            print(f"saved -> {ckpt_path}")
     finally:
         train_stream.close()
         val_stream.close()
+        if is_distributed and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
