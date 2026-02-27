@@ -4,6 +4,7 @@ import math
 import os
 import platform
 import queue
+import random
 import sys
 import threading
 import time
@@ -127,6 +128,10 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
     p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"], help="Apply a training preset")
+    p.add_argument("--stream", action="store_true", default=False,
+                   help="Use HF streaming mode (slower, no pre-download needed)")
+    p.add_argument("--download", action="store_true", default=False,
+                   help="Download the dataset to local cache and exit (run once before training)")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("-5080", dest="preset_5080", action="store_true", help="Use RTX 5080-oriented preset")
@@ -182,12 +187,11 @@ def parse_args():
 
 
 def estimate_params(vocab, context, n_embd, n_layer):
-    # rough GPT estimate (embeddings + blocks + lm head)
     return (
-        vocab * n_embd  # token embedding
-        + context * n_embd  # position embedding
-        + n_layer * (12 * n_embd * n_embd + 13 * n_embd)  # attention + MLP + norms
-        + n_embd * vocab  # lm head
+        vocab * n_embd
+        + context * n_embd
+        + n_layer * (12 * n_embd * n_embd + 13 * n_embd)
+        + n_embd * vocab
     )
 
 
@@ -206,7 +210,6 @@ def ensure_tokenizer(args, is_main=True):
     except Exception:
         pass
 
-    # Only rank 0 builds; other ranks wait for the file to appear.
     if is_main:
         print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
         seed_path = "tokenizer_seed.txt"
@@ -229,12 +232,15 @@ def ensure_tokenizer(args, is_main=True):
             unk_id=0,
         )
 
-    # In distributed mode, non-main ranks wait for rank 0 to finish building.
     if dist.is_initialized():
         dist.barrier()
 
     return spm.SentencePieceProcessor(model_file=tok_model)
 
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 class Block(nn.Module):
     def __init__(self, n_embd, n_head, dropout):
@@ -304,23 +310,137 @@ class GPT(nn.Module):
         return logits, loss
 
 
-class _SharedDocIterator:
-    """Thread-safe wrapper around a HuggingFace streaming dataset iterator.
+# ---------------------------------------------------------------------------
+# Data loaders
+# ---------------------------------------------------------------------------
 
-    Ensures multiple worker threads within a single rank pull *different*
-    documents from the same shard rather than duplicating data.
+class _AtomicCounter:
+    """Thread-safe counter for distributing work across worker threads."""
+    def __init__(self, start=0):
+        self._val = start
+        self._lock = threading.Lock()
+
+    def get_and_increment(self):
+        with self._lock:
+            v = self._val
+            self._val += 1
+            return v
+
+    def reset(self, val=0):
+        with self._lock:
+            self._val = val
+
+
+class LocalBatcher:
+    """High-throughput batcher that reads from a pre-downloaded HF dataset.
+
+    - No network I/O during training (reads from local Arrow/parquet cache).
+    - Each rank gets a disjoint shard via index arithmetic.
+    - Multiple worker threads tokenize in parallel from the shared dataset.
+    - Shuffles document order each epoch for better training dynamics.
     """
+
+    def __init__(self, sp, dataset, context, batch_size, queue_size=256,
+                 num_workers=4, rank=0, world_size=1, seed=42):
+        self.sp = sp
+        self.eos_id = sp.eos_id()
+        self.context = context
+        self.batch_size = batch_size
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stop = threading.Event()
+        self.rank = rank
+        self.world_size = max(1, world_size)
+        self.seed = seed
+
+        # Dataset is an Arrow-backed HF Dataset (supports integer indexing).
+        self.dataset = dataset
+        total = len(dataset)
+        # This rank's document indices: [rank, rank+ws, rank+2*ws, ...]
+        self.indices = list(range(rank, total, world_size))
+
+        self.num_workers = max(1, num_workers)
+        self._counter = _AtomicCounter(0)
+        self._epoch = 0
+        self._epoch_lock = threading.Lock()
+        self._shuffled_indices = list(self.indices)
+        random.Random(seed + rank).shuffle(self._shuffled_indices)
+
+        self.workers = []
+        for _ in range(self.num_workers):
+            w = threading.Thread(target=self._run, daemon=True)
+            w.start()
+            self.workers.append(w)
+
+    def _get_next_doc_index(self):
+        """Return the next dataset index for this worker, or None if epoch done."""
+        pos = self._counter.get_and_increment()
+        if pos < len(self._shuffled_indices):
+            return self._shuffled_indices[pos]
+        return None
+
+    def _advance_epoch(self):
+        """Start a new epoch with freshly shuffled indices."""
+        with self._epoch_lock:
+            # Only one thread should advance; others just get the new indices.
+            self._epoch += 1
+            self._shuffled_indices = list(self.indices)
+            random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_indices)
+            self._counter.reset(0)
+
+    def _run(self):
+        token_buf = deque()
+        while not self.stop.is_set():
+            idx = self._get_next_doc_index()
+            if idx is None:
+                # Epoch boundary: reshuffle and continue.
+                self._advance_epoch()
+                continue
+
+            txt = (self.dataset[idx].get("text") or "").strip()
+            if not txt:
+                continue
+            ids = self.sp.encode(txt, out_type=int)
+            if ids:
+                token_buf.extend(ids)
+                token_buf.append(self.eos_id)
+
+            needed = self.batch_size * (self.context + 1)
+            while len(token_buf) >= needed and not self.stop.is_set():
+                block = [token_buf.popleft() for _ in range(needed)]
+                t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
+                x = t[:, :-1].contiguous()
+                y = t[:, 1:].contiguous()
+                try:
+                    self.q.put((x, y), timeout=1.0)
+                except queue.Full:
+                    if self.stop.is_set():
+                        break
+                    continue
+
+    def next(self, device):
+        x, y = self.q.get(timeout=120)
+        if str(device).startswith("cuda"):
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+        else:
+            x = x.to(device)
+            y = y.to(device)
+        return x, y
+
+    def close(self):
+        self.stop.set()
+
+
+class _SharedDocIterator:
+    """Thread-safe wrapper around a HuggingFace streaming dataset iterator."""
 
     def __init__(self, config, rank=0, world_size=1):
         ds = load_dataset("HuggingFaceFW/fineweb-edu", config, split="train", streaming=True)
         if world_size > 1:
-            # Native shard: each rank only downloads its 1/world_size slice
-            # of the underlying parquet files (no redundant network I/O).
             try:
                 from datasets.distributed import split_dataset_by_node
                 ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
             except ImportError:
-                # Fallback for older datasets lib: manual islice (downloads all, skips).
                 ds = itertools.islice(ds, rank, None, world_size)
         self._it = iter(ds)
         self._lock = threading.Lock()
@@ -331,19 +451,17 @@ class _SharedDocIterator:
 
 
 class StreamingBatcher:
-    def __init__(self, sp, config, context, batch_size, queue_size=64, num_workers=2, rank=0, world_size=1):
+    """Network-streaming batcher (fallback for when dataset isn't pre-downloaded)."""
+
+    def __init__(self, sp, config, context, batch_size, queue_size=64,
+                 num_workers=2, rank=0, world_size=1):
         self.sp = sp
         self.eos_id = sp.eos_id()
         self.context = context
         self.batch_size = batch_size
         self.q = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
-        self.config = config
-        self.rank = rank
-        self.world_size = max(1, world_size)
         self.num_workers = max(1, num_workers)
-        # Single shared iterator: all worker threads pull from one stream,
-        # so no document is seen twice within a rank.
         self._shared_docs = _SharedDocIterator(config, rank=rank, world_size=world_size)
         self.workers = []
         for _ in range(self.num_workers):
@@ -393,8 +511,69 @@ class StreamingBatcher:
         self.stop.set()
 
 
+# ---------------------------------------------------------------------------
+# Batcher factory
+# ---------------------------------------------------------------------------
+
+def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
+    """Create the right batcher based on --stream flag.
+
+    Default (local):  reads from pre-downloaded HF cache. Much faster for
+                      multi-GPU because there's zero network I/O during training.
+    --stream:         streams from HF Hub (original behavior). Fine for single-GPU
+                      or when you don't want to pre-download.
+    """
+    if is_val:
+        qsize = max(16, args.queue_size // 2)
+        nw = max(1, args.num_workers // 2)
+    else:
+        qsize = args.queue_size
+        nw = args.num_workers
+
+    if args.stream:
+        if is_main and not is_val:
+            print("data: streaming from HuggingFace Hub")
+        return StreamingBatcher(
+            sp, args.config, args.context, args.batch_size,
+            queue_size=qsize, num_workers=nw,
+            rank=rank, world_size=world_size,
+        )
+
+    # Local mode: load from cache (or download if not cached).
+    # Only rank 0 triggers download; others wait at the barrier.
+    ds = None
+    if is_main:
+        print("data: loading dataset from local cache (downloading if needed)...")
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
+        print(f"data: {len(ds):,} documents loaded")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Non-main ranks load after rank 0 has ensured the cache exists.
+    if ds is None:
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
+
+    return LocalBatcher(
+        sp, ds, args.context, args.batch_size,
+        queue_size=qsize, num_workers=nw,
+        rank=rank, world_size=world_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     args = parse_args()
+
+    # Download-only mode: fetch dataset to local cache and exit.
+    if args.download:
+        print(f"Downloading HuggingFaceFW/fineweb-edu [{args.config}] ...")
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
+        print(f"Done. {len(ds):,} documents cached at: {ds.cache_files}")
+        return
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -419,16 +598,10 @@ def main():
     sp = ensure_tokenizer(args, is_main=is_main)
     vocab = sp.vocab_size()
 
-    train_stream = StreamingBatcher(
-        sp, args.config, args.context, args.batch_size,
-        queue_size=args.queue_size, num_workers=args.num_workers,
-        rank=rank, world_size=world_size,
-    )
-    val_stream = StreamingBatcher(
-        sp, args.config, args.context, args.batch_size,
-        queue_size=max(16, args.queue_size // 2), num_workers=max(1, args.num_workers // 2),
-        rank=rank, world_size=world_size,
-    )
+    train_batcher = make_batcher(sp, args, rank=rank, world_size=world_size,
+                                  is_main=is_main, is_val=False)
+    val_batcher = make_batcher(sp, args, rank=rank, world_size=world_size,
+                                is_main=is_main, is_val=True)
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
     if str(device).startswith("cuda") and platform.system() != "Windows":
@@ -443,8 +616,6 @@ def main():
 
     opt = None
     if str(device).startswith("cuda"):
-        # PyTorch forbids fused=True and foreach=True together.
-        # Try fused first (usually fastest on CUDA), then foreach, then plain.
         try:
             if is_main:
                 print("Optimizing with AdamW fused")
@@ -469,7 +640,6 @@ def main():
             except (TypeError, RuntimeError):
                 if is_main:
                     print("AdamW optimization Failed")
-                pass
 
     if opt is None:
         opt = torch.optim.AdamW(
@@ -494,7 +664,7 @@ def main():
         model.eval()
         vals = []
         for _ in range(iters):
-            xb, yb = val_stream.next(device)
+            xb, yb = val_batcher.next(device)
             with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
                 _, loss = model(xb, yb)
             vals.append(loss.item())
@@ -507,19 +677,17 @@ def main():
         return local_mean
 
     raw_model = model.module if isinstance(model, DDP) else model
-    # Unwrap torch.compile if present
     if hasattr(raw_model, "_orig_mod"):
         raw_model = raw_model._orig_mod
     params = sum(p.numel() for p in raw_model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
-    # Global tokens per step: each rank processes batch_size * context * grad_accum tokens,
-    # and there are world_size ranks training in parallel.
     tokens_per_step = args.batch_size * args.context * args.grad_accum * world_size
+    data_mode = "streaming" if args.stream else "local"
     if is_main:
         print(
             f"gpus={world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
             f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} "
-            f"| global_batch={args.batch_size * args.grad_accum * world_size} | full-streaming=yes"
+            f"| global_batch={args.batch_size * args.grad_accum * world_size} | data={data_mode}"
         )
 
     ckpt_path = "fineweb_gpt.ckpt"
@@ -552,7 +720,7 @@ def main():
                 pg["lr"] = cur_lr
             opt.zero_grad(set_to_none=True)
             for _ in range(args.grad_accum):
-                xb, yb = train_stream.next(device)
+                xb, yb = train_batcher.next(device)
                 with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
                     _, loss = model(xb, yb)
                     loss = loss / args.grad_accum
@@ -572,8 +740,8 @@ def main():
             torch.save({"state_dict": raw_model.state_dict(), "args": vars(args), "vocab": vocab}, ckpt_path)
             print(f"saved -> {ckpt_path}")
     finally:
-        train_stream.close()
-        val_stream.close()
+        train_batcher.close()
+        val_batcher.close()
         if is_distributed and dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
