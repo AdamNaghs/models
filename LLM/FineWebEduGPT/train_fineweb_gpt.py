@@ -360,23 +360,25 @@ def main():
 
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
-    last_step_time = start_time
+    last_step_dt = 0.0
 
     try:
         for step in range(args.train_steps + 1):
             now = time.perf_counter()
-            step_gap = now - last_step_time if step > 0 else 0.0
             elapsed = now - start_time
             avg_step = elapsed / max(step, 1)
             eta = max(args.train_steps - step, 0) * avg_step
 
-            if step % args.eval_every == 0:
+            if step == 1 or step % args.eval_every == 0:
+                eval_start = time.perf_counter()
                 v = eval_loss(args.eval_iters)
+                eval_dt = time.perf_counter() - eval_start
                 print(
                     f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
-                    f"dt {step_gap:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
+                    f"dt {last_step_dt:.2f}s | eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                 )
 
+            step_start = time.perf_counter()
             opt.zero_grad(set_to_none=True)
             for _ in range(args.grad_accum):
                 xb, yb = train_stream.next(device)
@@ -387,7 +389,7 @@ def main():
 
             scaler.step(opt)
             scaler.update()
-            last_step_time = time.perf_counter()
+            last_step_dt = time.perf_counter() - step_start
 
             if step > 0 and step % args.ckpt_every == 0:
                 sd = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
