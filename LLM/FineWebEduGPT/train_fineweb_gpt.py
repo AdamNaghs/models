@@ -382,6 +382,7 @@ def main():
         # PyTorch forbids fused=True and foreach=True together.
         # Try fused first (usually fastest on CUDA), then foreach, then plain.
         try:
+            print("Optimizing with AdamW fused")
             opt = torch.optim.AdamW(
                 model.parameters(),
                 lr=args.lr,
@@ -389,7 +390,8 @@ def main():
                 weight_decay=args.weight_decay,
                 fused=True,
             )
-        except (TypeError, RuntimeError):
+        except (TypeError, RuntimeError) as e:
+            print(f"Encountered Error '{e}', Falling back to AdamW foreach")
             try:
                 opt = torch.optim.AdamW(
                     model.parameters(),
@@ -399,6 +401,7 @@ def main():
                     foreach=True,
                 )
             except (TypeError, RuntimeError):
+                print("AdamW optimization Failed")
                 pass
 
     if opt is None:
