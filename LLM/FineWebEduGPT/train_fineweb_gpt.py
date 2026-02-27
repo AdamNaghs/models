@@ -1,14 +1,18 @@
 import argparse
+import glob
 import itertools
+import json
 import math
 import os
 import platform
 import queue
 import random
+import shutil
 import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import sentencepiece as spm
 import torch
@@ -93,6 +97,9 @@ PRESETS = {
 }
 
 
+HF_DATASET = "HuggingFaceFW/fineweb-edu"
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Full-streaming GPT trainer on FineWeb-Edu")
     p.add_argument(
@@ -128,17 +135,28 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
     p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"], help="Apply a training preset")
+
+    # Data loading modes (mutually exclusive):
+    #   default:    local pre-downloaded dataset (fastest, needs full disk space)
+    #   --stream:   HF streaming (no disk, network-bound)
+    #   --cache-gb: rolling cache (downloads N GB, trains, deletes, repeats)
     p.add_argument("--stream", action="store_true", default=False,
                    help="Use HF streaming mode (slower, no pre-download needed)")
+    p.add_argument("--cache-gb", type=float, default=0,
+                   help="Rolling cache size in GB. Downloads this much data, trains on it, "
+                        "deletes, and downloads the next chunk. Ideal for large datasets on "
+                        "rented machines with limited disk. (0 = disabled, use full download)")
+    p.add_argument("--cache-dir", type=str, default=".data_cache",
+                   help="Directory for rolling cache parquet files (default: .data_cache)")
     p.add_argument("--download", action="store_true", default=False,
                    help="Download the dataset to local cache and exit (run once before training)")
 
     g = p.add_mutually_exclusive_group()
-    g.add_argument("-5080", dest="preset_5080", action="store_true", help="Use RTX 5080-oriented preset")
-    g.add_argument("-HPC", dest="preset_hpc", action="store_true", help="Use large HPC preset")
-    g.add_argument("-10B", dest="preset_10b", action="store_true", help="Use 10B-target preset")
-    g.add_argument("-A100", dest="preset_a100", action="store_true", help="Use A100 cluster preset")
-    g.add_argument("-H100", dest="preset_h100", action="store_true", help="Use H100 cluster preset")
+    g.add_argument("-5080", dest="preset_5080", action="store_true")
+    g.add_argument("-HPC", dest="preset_hpc", action="store_true")
+    g.add_argument("-10B", dest="preset_10b", action="store_true")
+    g.add_argument("-A100", dest="preset_a100", action="store_true")
+    g.add_argument("-H100", dest="preset_h100", action="store_true")
 
     args = p.parse_args()
 
@@ -153,7 +171,6 @@ def parse_args():
     elif args.preset_h100:
         args.preset = "h100"
 
-    # Precedence: explicit CLI flags > preset > parser defaults
     explicit_flags = set(a.split("=")[0] for a in sys.argv[1:] if a.startswith("-"))
     key_to_flags = {
         "train_steps": {"--train-steps"},
@@ -213,7 +230,7 @@ def ensure_tokenizer(args, is_main=True):
     if is_main:
         print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
         seed_path = "tokenizer_seed.txt"
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train", streaming=True)
+        ds = load_dataset(HF_DATASET, args.config, split="train", streaming=True)
         with open(seed_path, "w", encoding="utf-8") as f:
             for ex in itertools.islice(ds, args.seed_docs):
                 t = (ex.get("text") or "").strip()
@@ -245,7 +262,7 @@ def ensure_tokenizer(args, is_main=True):
 class Block(nn.Module):
     def __init__(self, n_embd, n_head, dropout):
         super().__init__()
-        assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
+        assert n_embd % n_head == 0
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         self.ln1 = nn.LayerNorm(n_embd)
@@ -266,23 +283,20 @@ class Block(nn.Module):
         x_norm = self.ln1(x)
         qkv = self.qkv(x_norm)
         q, k, v = qkv.split(c, dim=2)
-
         q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
 
         if x.is_cuda:
             y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
+                q, k, v, attn_mask=None,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
                 is_causal=True,
             )
         else:
             m = torch.triu(torch.ones(t, t, device=x.device), diagonal=1).bool()
             y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=m,
+                q, k, v, attn_mask=m,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
                 is_causal=False,
             )
@@ -332,12 +346,12 @@ class _AtomicCounter:
 
 
 class LocalBatcher:
-    """High-throughput batcher that reads from a pre-downloaded HF dataset.
+    """High-throughput batcher from a pre-loaded HF Dataset (Arrow-backed).
 
-    - No network I/O during training (reads from local Arrow/parquet cache).
-    - Each rank gets a disjoint shard via index arithmetic.
-    - Multiple worker threads tokenize in parallel from the shared dataset.
-    - Shuffles document order each epoch for better training dynamics.
+    - Zero network I/O (reads from memory-mapped local files).
+    - Disjoint per-rank sharding via index arithmetic.
+    - Atomic counter ensures no document duplication across worker threads.
+    - Reshuffles each epoch.
     """
 
     def __init__(self, sp, dataset, context, batch_size, queue_size=256,
@@ -352,10 +366,8 @@ class LocalBatcher:
         self.world_size = max(1, world_size)
         self.seed = seed
 
-        # Dataset is an Arrow-backed HF Dataset (supports integer indexing).
         self.dataset = dataset
         total = len(dataset)
-        # This rank's document indices: [rank, rank+ws, rank+2*ws, ...]
         self.indices = list(range(rank, total, world_size))
 
         self.num_workers = max(1, num_workers)
@@ -372,16 +384,13 @@ class LocalBatcher:
             self.workers.append(w)
 
     def _get_next_doc_index(self):
-        """Return the next dataset index for this worker, or None if epoch done."""
         pos = self._counter.get_and_increment()
         if pos < len(self._shuffled_indices):
             return self._shuffled_indices[pos]
         return None
 
     def _advance_epoch(self):
-        """Start a new epoch with freshly shuffled indices."""
         with self._epoch_lock:
-            # Only one thread should advance; others just get the new indices.
             self._epoch += 1
             self._shuffled_indices = list(self.indices)
             random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_indices)
@@ -392,7 +401,6 @@ class LocalBatcher:
         while not self.stop.is_set():
             idx = self._get_next_doc_index()
             if idx is None:
-                # Epoch boundary: reshuffle and continue.
                 self._advance_epoch()
                 continue
 
@@ -423,8 +431,7 @@ class LocalBatcher:
             x = x.pin_memory().to(device, non_blocking=True)
             y = y.pin_memory().to(device, non_blocking=True)
         else:
-            x = x.to(device)
-            y = y.to(device)
+            x, y = x.to(device), y.to(device)
         return x, y
 
     def close(self):
@@ -432,10 +439,10 @@ class LocalBatcher:
 
 
 class _SharedDocIterator:
-    """Thread-safe wrapper around a HuggingFace streaming dataset iterator."""
+    """Thread-safe iterator for HF streaming datasets."""
 
     def __init__(self, config, rank=0, world_size=1):
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", config, split="train", streaming=True)
+        ds = load_dataset(HF_DATASET, config, split="train", streaming=True)
         if world_size > 1:
             try:
                 from datasets.distributed import split_dataset_by_node
@@ -451,7 +458,7 @@ class _SharedDocIterator:
 
 
 class StreamingBatcher:
-    """Network-streaming batcher (fallback for when dataset isn't pre-downloaded)."""
+    """Network-streaming batcher (fallback for single-GPU / no disk)."""
 
     def __init__(self, sp, config, context, batch_size, queue_size=64,
                  num_workers=2, rank=0, world_size=1):
@@ -503,8 +510,7 @@ class StreamingBatcher:
             x = x.pin_memory().to(device, non_blocking=True)
             y = y.pin_memory().to(device, non_blocking=True)
         else:
-            x = x.to(device)
-            y = y.to(device)
+            x, y = x.to(device), y.to(device)
         return x, y
 
     def close(self):
@@ -512,17 +518,289 @@ class StreamingBatcher:
 
 
 # ---------------------------------------------------------------------------
+# Rolling cache: download N GB -> train -> delete -> repeat
+# ---------------------------------------------------------------------------
+
+CACHE_STATE_FILE = "cache_state.json"
+
+
+def _list_parquet_urls(config):
+    """List all parquet file URLs for a FineWeb-Edu config via HF Hub API."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        files = api.list_repo_tree(HF_DATASET, repo_type="dataset", path_in_repo=f"data/{config}")
+        urls = []
+        for f in files:
+            if hasattr(f, "rfilename") and f.rfilename.endswith(".parquet"):
+                urls.append(f.rfilename)
+        urls.sort()
+        return urls
+    except Exception as e:
+        print(f"Warning: could not list parquet files via HfApi: {e}")
+        print("Falling back to pattern-based shard listing...")
+        # Fallback: generate expected shard paths (common pattern for fineweb-edu)
+        shards = []
+        for i in range(2500):
+            shards.append(f"data/{config}/{i:03d}_{i:05d}.parquet")
+        return shards
+
+
+def _load_cache_state(state_path):
+    """Load rolling cache progress state."""
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            return json.load(f)
+    return {"next_shard_idx": 0, "total_shards_trained": 0}
+
+
+def _save_cache_state(state_path, state):
+    """Persist rolling cache progress."""
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
+    """Download parquet shards into cache_dir up to max_bytes.
+
+    Returns list of local file paths that were downloaded.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise ImportError("huggingface_hub is required for --cache-gb mode. "
+                          "Install with: pip install huggingface_hub")
+
+    os.makedirs(cache_dir, exist_ok=True)
+    downloaded = []
+    total_bytes = 0
+
+    for shard_path in shard_paths:
+        if total_bytes >= max_bytes:
+            break
+        try:
+            local_path = hf_hub_download(
+                repo_id=HF_DATASET,
+                filename=shard_path,
+                repo_type="dataset",
+                local_dir=cache_dir,
+                local_dir_use_symlinks=False,
+            )
+            fsize = os.path.getsize(local_path)
+            total_bytes += fsize
+            downloaded.append(local_path)
+            if is_main:
+                print(f"  cached: {shard_path} ({fsize / 1e9:.2f} GB, total: {total_bytes / 1e9:.2f} GB)")
+        except Exception as e:
+            if is_main:
+                print(f"  skip: {shard_path} ({e})")
+            continue
+
+    return downloaded
+
+
+def _clear_cache(cache_dir, is_main=True):
+    """Delete all files in the rolling cache directory."""
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        if is_main:
+            print(f"cache: cleared {cache_dir}")
+
+
+class RollingCacheBatcher:
+    """Downloads data in chunks, trains on each chunk, then deletes and moves on.
+
+    Wraps LocalBatcher internally. When all documents in the current chunk are
+    consumed (epoch boundary), it signals for the next chunk to be loaded.
+
+    This class is designed to be used as a drop-in replacement for LocalBatcher
+    in the training loop, but the chunk rotation is driven externally by the
+    training loop calling `maybe_rotate()` periodically.
+    """
+
+    def __init__(self, sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
+        self.sp = sp
+        self.args = args
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main = is_main
+        self.is_val = is_val
+        self.cache_dir = args.cache_dir
+        self.max_bytes = int(args.cache_gb * 1e9)
+        self.state_path = os.path.join(self.cache_dir, CACHE_STATE_FILE)
+
+        if is_val:
+            self.qsize = max(16, args.queue_size // 2)
+            self.nw = max(1, args.num_workers // 2)
+        else:
+            self.qsize = args.queue_size
+            self.nw = args.num_workers
+
+        # List all available shards.
+        if is_main:
+            self._all_shards = _list_parquet_urls(args.config)
+            # Save shard list so non-main ranks can read it.
+            shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(shard_list_path, "w") as f:
+                json.dump(self._all_shards, f)
+            print(f"cache: found {len(self._all_shards)} parquet shards for {args.config}")
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not is_main:
+            shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
+            with open(shard_list_path) as f:
+                self._all_shards = json.load(f)
+
+        # Load progress state (which shard we're on).
+        self._state = _load_cache_state(self.state_path) if is_main else {"next_shard_idx": 0}
+
+        # Broadcast state from rank 0.
+        if dist.is_initialized():
+            if is_main:
+                state_bytes = json.dumps(self._state).encode()
+                state_tensor = torch.tensor(list(state_bytes), dtype=torch.uint8).cuda()
+                size_tensor = torch.tensor([len(state_bytes)], dtype=torch.long).cuda()
+                dist.broadcast(size_tensor, src=0)
+                dist.broadcast(state_tensor, src=0)
+            else:
+                size_tensor = torch.tensor([0], dtype=torch.long).cuda()
+                dist.broadcast(size_tensor, src=0)
+                state_tensor = torch.zeros(size_tensor.item(), dtype=torch.uint8).cuda()
+                dist.broadcast(state_tensor, src=0)
+                self._state = json.loads(bytes(state_tensor.tolist()).decode())
+
+        self._inner = None
+        self._load_next_chunk()
+
+    def _load_next_chunk(self):
+        """Download next batch of shards, create LocalBatcher."""
+        # Close previous batcher if any.
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
+
+        idx = self._state["next_shard_idx"]
+        remaining = self._all_shards[idx:]
+
+        if not remaining:
+            if self.is_main:
+                print("cache: all shards consumed. Wrapping to beginning.")
+            self._state["next_shard_idx"] = 0
+            remaining = self._all_shards
+
+        # Rank 0 downloads; others wait.
+        if self.is_main:
+            _clear_cache(self.cache_dir, is_main=True)
+            os.makedirs(self.cache_dir, exist_ok=True)
+            # Re-save shard list and state after clearing.
+            with open(os.path.join(self.cache_dir, "_shard_list.json"), "w") as f:
+                json.dump(self._all_shards, f)
+
+            downloaded = _download_shard_batch(remaining, self.cache_dir, self.max_bytes, is_main=True)
+            n_downloaded = len(downloaded)
+            print(f"cache: downloaded {n_downloaded} shards into {self.cache_dir}")
+
+            # Update state.
+            self._state["next_shard_idx"] = idx + n_downloaded
+            self._state["total_shards_trained"] = self._state.get("total_shards_trained", 0) + n_downloaded
+            _save_cache_state(self.state_path, self._state)
+
+            # Save download count for other ranks.
+            count_path = os.path.join(self.cache_dir, "_chunk_count.json")
+            with open(count_path, "w") as f:
+                json.dump({"n_shards": n_downloaded, "next_idx": self._state["next_shard_idx"]}, f)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        # All ranks: find the parquet files and load as dataset.
+        parquet_files = sorted(glob.glob(os.path.join(self.cache_dir, "**", "*.parquet"), recursive=True))
+        if not parquet_files:
+            raise RuntimeError(f"No parquet files found in {self.cache_dir} after download")
+
+        if self.is_main:
+            print(f"cache: loading {len(parquet_files)} parquet files as local dataset...")
+
+        ds = load_dataset("parquet", data_files=parquet_files, split="train")
+
+        if self.is_main:
+            print(f"cache: chunk loaded — {len(ds):,} documents")
+
+        # Read updated state on non-main ranks.
+        if not self.is_main:
+            count_path = os.path.join(self.cache_dir, "_chunk_count.json")
+            if os.path.exists(count_path):
+                with open(count_path) as f:
+                    info = json.load(f)
+                    self._state["next_shard_idx"] = info["next_idx"]
+
+        self._inner = LocalBatcher(
+            self.sp, ds, self.args.context, self.args.batch_size,
+            queue_size=self.qsize, num_workers=self.nw,
+            rank=self.rank, world_size=self.world_size,
+        )
+        self._chunk_docs = len(ds)
+
+    def next(self, device):
+        return self._inner.next(device)
+
+    def rotate_if_needed(self, steps_on_chunk):
+        """Call periodically from training loop to check if chunk is exhausted.
+
+        A simple heuristic: rotate after enough steps that we've likely seen
+        most documents in the chunk at least once.
+        """
+        # Estimate docs consumed: steps * batch_size * grad_accum * context tokens
+        # vs average doc length. Use a simple threshold: rotate after we've
+        # consumed roughly 1 epoch over the chunk.
+        tokens_consumed = steps_on_chunk * self.args.batch_size * self.args.context * self.args.grad_accum
+        # Rough estimate: avg doc is ~500 tokens after SP encoding.
+        docs_per_rank = self._chunk_docs // max(1, self.world_size)
+        tokens_in_chunk = docs_per_rank * 500  # conservative estimate
+
+        if tokens_consumed >= tokens_in_chunk and tokens_in_chunk > 0:
+            return True
+        return False
+
+    def load_next_chunk(self):
+        """Externally trigger chunk rotation."""
+        self._load_next_chunk()
+
+    def close(self):
+        if self._inner is not None:
+            self._inner.close()
+
+
+# ---------------------------------------------------------------------------
 # Batcher factory
 # ---------------------------------------------------------------------------
 
 def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
-    """Create the right batcher based on --stream flag.
+    """Create the right batcher based on data loading mode."""
 
-    Default (local):  reads from pre-downloaded HF cache. Much faster for
-                      multi-GPU because there's zero network I/O during training.
-    --stream:         streams from HF Hub (original behavior). Fine for single-GPU
-                      or when you don't want to pre-download.
-    """
+    if args.stream:
+        if is_main and not is_val:
+            print("data: streaming from HuggingFace Hub")
+        qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
+        nw = max(1, args.num_workers // 2) if is_val else args.num_workers
+        return StreamingBatcher(
+            sp, args.config, args.context, args.batch_size,
+            queue_size=qsize, num_workers=nw,
+            rank=rank, world_size=world_size,
+        )
+
+    if args.cache_gb > 0:
+        if is_main and not is_val:
+            print(f"data: rolling cache mode ({args.cache_gb} GB per chunk)")
+        return RollingCacheBatcher(
+            sp, args, rank=rank, world_size=world_size,
+            is_main=is_main, is_val=is_val,
+        )
+
+    # Full local download mode.
     if is_val:
         qsize = max(16, args.queue_size // 2)
         nw = max(1, args.num_workers // 2)
@@ -530,29 +808,17 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
         qsize = args.queue_size
         nw = args.num_workers
 
-    if args.stream:
-        if is_main and not is_val:
-            print("data: streaming from HuggingFace Hub")
-        return StreamingBatcher(
-            sp, args.config, args.context, args.batch_size,
-            queue_size=qsize, num_workers=nw,
-            rank=rank, world_size=world_size,
-        )
-
-    # Local mode: load from cache (or download if not cached).
-    # Only rank 0 triggers download; others wait at the barrier.
     ds = None
     if is_main:
         print("data: loading dataset from local cache (downloading if needed)...")
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
+        ds = load_dataset(HF_DATASET, args.config, split="train")
         print(f"data: {len(ds):,} documents loaded")
 
     if dist.is_initialized():
         dist.barrier()
 
-    # Non-main ranks load after rank 0 has ensured the cache exists.
     if ds is None:
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
+        ds = load_dataset(HF_DATASET, args.config, split="train")
 
     return LocalBatcher(
         sp, ds, args.context, args.batch_size,
@@ -568,11 +834,12 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 def main():
     args = parse_args()
 
-    # Download-only mode: fetch dataset to local cache and exit.
+    # Download-only mode.
     if args.download:
-        print(f"Downloading HuggingFaceFW/fineweb-edu [{args.config}] ...")
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train")
-        print(f"Done. {len(ds):,} documents cached at: {ds.cache_files}")
+        print(f"Downloading {HF_DATASET} [{args.config}] ...")
+        ds = load_dataset(HF_DATASET, args.config, split="train")
+        print(f"Done. {len(ds):,} documents cached.")
+        print(f"Cache files: {ds.cache_files}")
         return
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -620,22 +887,16 @@ def main():
             if is_main:
                 print("Optimizing with AdamW fused")
             opt = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                betas=(0.9, 0.95),
-                weight_decay=args.weight_decay,
-                fused=True,
+                model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                weight_decay=args.weight_decay, fused=True,
             )
         except (TypeError, RuntimeError) as e:
             if is_main:
                 print(f"Encountered Error '{e}', Falling back to AdamW foreach")
             try:
                 opt = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=args.lr,
-                    betas=(0.9, 0.95),
-                    weight_decay=args.weight_decay,
-                    foreach=True,
+                    model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                    weight_decay=args.weight_decay, foreach=True,
                 )
             except (TypeError, RuntimeError):
                 if is_main:
@@ -643,9 +904,7 @@ def main():
 
     if opt is None:
         opt = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            betas=(0.9, 0.95),
+            model.parameters(), lr=args.lr, betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
         )
 
@@ -682,7 +941,14 @@ def main():
     params = sum(p.numel() for p in raw_model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     tokens_per_step = args.batch_size * args.context * args.grad_accum * world_size
-    data_mode = "streaming" if args.stream else "local"
+
+    if args.cache_gb > 0:
+        data_mode = f"rolling-cache({args.cache_gb}GB)"
+    elif args.stream:
+        data_mode = "streaming"
+    else:
+        data_mode = "local"
+
     if is_main:
         print(
             f"gpus={world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
@@ -693,6 +959,8 @@ def main():
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
+    is_rolling = isinstance(train_batcher, RollingCacheBatcher)
+    chunk_step_start = 0  # track steps within current cache chunk
 
     try:
         for step in range(args.train_steps + 1):
@@ -700,6 +968,21 @@ def main():
             elapsed = now - start_time
             avg_step = elapsed / max(step, 1)
             eta = max(args.train_steps - step, 0) * avg_step
+
+            # Rolling cache: check if we need to rotate to next chunk.
+            if is_rolling and step > 0 and train_batcher.rotate_if_needed(step - chunk_step_start):
+                if is_main:
+                    print(f"cache: rotating to next chunk at step {step}")
+                    # Save checkpoint before rotation so progress isn't lost.
+                    torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
+                                "vocab": vocab, "step": step}, ckpt_path)
+                    print(f"checkpoint -> {ckpt_path} (pre-rotation)")
+                if dist.is_initialized():
+                    dist.barrier()
+                train_batcher.load_next_chunk()
+                chunk_step_start = step
+                if dist.is_initialized():
+                    dist.barrier()
 
             if step == 1 or step % args.eval_every == 0:
                 eval_start = time.perf_counter()
@@ -733,11 +1016,13 @@ def main():
             last_step_dt = time.perf_counter() - step_start
 
             if step > 0 and step % args.ckpt_every == 0 and is_main:
-                torch.save({"state_dict": raw_model.state_dict(), "args": vars(args), "vocab": vocab}, ckpt_path)
+                torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
+                            "vocab": vocab, "step": step}, ckpt_path)
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
         if is_main:
-            torch.save({"state_dict": raw_model.state_dict(), "args": vars(args), "vocab": vocab}, ckpt_path)
+            torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
+                        "vocab": vocab, "step": args.train_steps}, ckpt_path)
             print(f"saved -> {ckpt_path}")
     finally:
         train_batcher.close()
