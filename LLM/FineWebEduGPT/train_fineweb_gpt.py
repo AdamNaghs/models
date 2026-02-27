@@ -406,6 +406,7 @@ def main():
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
+    tokens_per_step = args.batch_size * args.context * args.grad_accum
 
     try:
         for step in range(args.train_steps + 1):
@@ -419,9 +420,11 @@ def main():
                 v = eval_loss(args.eval_iters)
                 eval_dt = time.perf_counter() - eval_start
                 cur_lr = opt.param_groups[0]["lr"]
+                toks_per_s = (tokens_per_step / last_step_dt) if last_step_dt > 0 else 0.0
                 print(
                     f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
-                    f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
+                    f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
+                    f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                 )
 
             step_start = time.perf_counter()
