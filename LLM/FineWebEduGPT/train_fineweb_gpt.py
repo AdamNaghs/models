@@ -15,18 +15,18 @@ from datasets import load_dataset
 
 PRESETS = {
     "5080": {
-        "train_steps": 100000,
-        "batch_size": 8,
-        "context": 512,
-        "n_layer": 12,
-        "n_head": 10,
-        "n_embd": 640,
-        "grad_accum": 16,
-        "vocab_size": 16000,
+        "train_steps": 150000,
+        "batch_size": 2,
+        "context": 1024,
+        "n_layer": 20,
+        "n_head": 16,
+        "n_embd": 1024,
+        "grad_accum": 32,
+        "vocab_size": 32000,
         "eval_every": 500,
         "eval_iters": 12,
         "ckpt_every": 2000,
-        "seed_docs": 50000,
+        "seed_docs": 100000,
     },
     "hpc": {
         "train_steps": 200000,
