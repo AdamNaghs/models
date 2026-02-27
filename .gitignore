@@ -1,3 +1,28 @@
-LLM/raw
-*__pycache__**
-*llmvenv**
+# Data/artifacts
+LLM/raw/
+LLM/**/raw/
+LLM/**/.tmp/
+*.zip
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env/secrets
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+id_rsa*
