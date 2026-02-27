@@ -121,6 +121,7 @@ def parse_args():
     p.add_argument("--vocab-size", type=int, default=16000)
     p.add_argument("--tokenizer-model", default="tokenizer.model")
     p.add_argument("--queue-size", type=int, default=64)
+    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
     p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"], help="Apply a training preset")
 
@@ -165,6 +166,7 @@ def parse_args():
         "vocab_size": {"--vocab-size"},
         "tokenizer_model": {"--tokenizer-model"},
         "queue_size": {"--queue-size"},
+        "num_workers": {"--num-workers"},
         "seed_docs": {"--seed-docs"},
     }
 
@@ -292,7 +294,7 @@ class GPT(nn.Module):
 
 
 class StreamingBatcher:
-    def __init__(self, sp, config, context, batch_size, queue_size=64):
+    def __init__(self, sp, config, context, batch_size, queue_size=64, num_workers=2):
         self.sp = sp
         self.eos_id = sp.eos_id()
         self.context = context
@@ -300,8 +302,12 @@ class StreamingBatcher:
         self.q = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
         self.config = config
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
+        self.num_workers = max(1, num_workers)
+        self.workers = []
+        for _ in range(self.num_workers):
+            w = threading.Thread(target=self._run, daemon=True)
+            w.start()
+            self.workers.append(w)
 
     def _run(self):
         ds = load_dataset("HuggingFaceFW/fineweb-edu", self.config, split="train", streaming=True)
@@ -349,12 +355,20 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     sp = ensure_tokenizer(args)
     vocab = sp.vocab_size()
 
-    train_stream = StreamingBatcher(sp, args.config, args.context, args.batch_size, queue_size=args.queue_size)
-    val_stream = StreamingBatcher(sp, args.config, args.context, args.batch_size, queue_size=max(16, args.queue_size // 2))
+    train_stream = StreamingBatcher(
+        sp, args.config, args.context, args.batch_size,
+        queue_size=args.queue_size, num_workers=args.num_workers
+    )
+    val_stream = StreamingBatcher(
+        sp, args.config, args.context, args.batch_size,
+        queue_size=max(16, args.queue_size // 2), num_workers=max(1, args.num_workers // 2)
+    )
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
     if device == "cuda" and platform.system() != "Windows":
@@ -370,9 +384,19 @@ def main():
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
             fused=(device == "cuda"),
+            foreach=True,
         )
     except TypeError:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+        try:
+            opt = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                betas=(0.9, 0.95),
+                weight_decay=args.weight_decay,
+                foreach=True,
+            )
+        except TypeError:
+            opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
@@ -400,7 +424,7 @@ def main():
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     print(
         f"device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
-        f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | full-streaming=yes"
+        f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} | full-streaming=yes"
     )
 
     ckpt_path = "fineweb_gpt.ckpt"
