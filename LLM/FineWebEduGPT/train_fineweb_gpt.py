@@ -3,6 +3,7 @@ import itertools
 import math
 import platform
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -141,9 +142,32 @@ def parse_args():
     elif args.preset_h100:
         args.preset = "h100"
 
+    # Precedence: explicit CLI flags > preset > parser defaults
+    explicit_flags = set(a.split("=")[0] for a in sys.argv[1:] if a.startswith("-"))
+    key_to_flags = {
+        "train_steps": {"--train-steps"},
+        "batch_size": {"--batch-size"},
+        "context": {"--context"},
+        "n_layer": {"--n-layer"},
+        "n_head": {"--n-head"},
+        "n_embd": {"--n-embd"},
+        "dropout": {"--dropout"},
+        "lr": {"--lr"},
+        "weight_decay": {"--weight-decay"},
+        "eval_every": {"--eval-every"},
+        "eval_iters": {"--eval-iters"},
+        "ckpt_every": {"--ckpt-every"},
+        "grad_accum": {"--grad-accum"},
+        "vocab_size": {"--vocab-size"},
+        "tokenizer_model": {"--tokenizer-model"},
+        "queue_size": {"--queue-size"},
+        "seed_docs": {"--seed-docs"},
+    }
+
     if args.preset:
         for k, v in PRESETS[args.preset].items():
-            setattr(args, k, v)
+            if not (key_to_flags.get(k, set()) & explicit_flags):
+                setattr(args, k, v)
 
     return args
 
