@@ -191,7 +191,7 @@ def estimate_params(vocab, context, n_embd, n_layer):
     )
 
 
-def ensure_tokenizer(args):
+def ensure_tokenizer(args, is_main=True):
     tok_model = args.tokenizer_model
     if platform.system() == "Windows":
         prefix = tok_model.replace(".model", "")
@@ -200,31 +200,39 @@ def ensure_tokenizer(args):
 
     try:
         sp = spm.SentencePieceProcessor(model_file=tok_model)
-        print(f"Using existing tokenizer: {tok_model}")
+        if is_main:
+            print(f"Using existing tokenizer: {tok_model}")
         return sp
     except Exception:
         pass
 
-    print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
-    seed_path = "tokenizer_seed.txt"
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train", streaming=True)
-    with open(seed_path, "w", encoding="utf-8") as f:
-        for ex in itertools.islice(ds, args.seed_docs):
-            t = (ex.get("text") or "").strip()
-            if t:
-                f.write(t + "\n")
+    # Only rank 0 builds; other ranks wait for the file to appear.
+    if is_main:
+        print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
+        seed_path = "tokenizer_seed.txt"
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", args.config, split="train", streaming=True)
+        with open(seed_path, "w", encoding="utf-8") as f:
+            for ex in itertools.islice(ds, args.seed_docs):
+                t = (ex.get("text") or "").strip()
+                if t:
+                    f.write(t + "\n")
 
-    spm.SentencePieceTrainer.train(
-        input=seed_path,
-        model_prefix=prefix,
-        vocab_size=args.vocab_size,
-        model_type="bpe",
-        character_coverage=1.0,
-        bos_id=1,
-        eos_id=2,
-        pad_id=3,
-        unk_id=0,
-    )
+        spm.SentencePieceTrainer.train(
+            input=seed_path,
+            model_prefix=prefix,
+            vocab_size=args.vocab_size,
+            model_type="bpe",
+            character_coverage=1.0,
+            bos_id=1,
+            eos_id=2,
+            pad_id=3,
+            unk_id=0,
+        )
+
+    # In distributed mode, non-main ranks wait for rank 0 to finish building.
+    if dist.is_initialized():
+        dist.barrier()
+
     return spm.SentencePieceProcessor(model_file=tok_model)
 
 
@@ -296,6 +304,32 @@ class GPT(nn.Module):
         return logits, loss
 
 
+class _SharedDocIterator:
+    """Thread-safe wrapper around a HuggingFace streaming dataset iterator.
+
+    Ensures multiple worker threads within a single rank pull *different*
+    documents from the same shard rather than duplicating data.
+    """
+
+    def __init__(self, config, rank=0, world_size=1):
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", config, split="train", streaming=True)
+        if world_size > 1:
+            # Native shard: each rank only downloads its 1/world_size slice
+            # of the underlying parquet files (no redundant network I/O).
+            try:
+                from datasets.distributed import split_dataset_by_node
+                ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
+            except ImportError:
+                # Fallback for older datasets lib: manual islice (downloads all, skips).
+                ds = itertools.islice(ds, rank, None, world_size)
+        self._it = iter(ds)
+        self._lock = threading.Lock()
+
+    def __next__(self):
+        with self._lock:
+            return next(self._it)
+
+
 class StreamingBatcher:
     def __init__(self, sp, config, context, batch_size, queue_size=64, num_workers=2, rank=0, world_size=1):
         self.sp = sp
@@ -308,6 +342,9 @@ class StreamingBatcher:
         self.rank = rank
         self.world_size = max(1, world_size)
         self.num_workers = max(1, num_workers)
+        # Single shared iterator: all worker threads pull from one stream,
+        # so no document is seen twice within a rank.
+        self._shared_docs = _SharedDocIterator(config, rank=rank, world_size=world_size)
         self.workers = []
         for _ in range(self.num_workers):
             w = threading.Thread(target=self._run, daemon=True)
@@ -315,12 +352,11 @@ class StreamingBatcher:
             self.workers.append(w)
 
     def _run(self):
-        ds = load_dataset("HuggingFaceFW/fineweb-edu", self.config, split="train", streaming=True)
-        if self.world_size > 1:
-            ds = itertools.islice(ds, self.rank, None, self.world_size)
         token_buf = deque()
-        for ex in ds:
-            if self.stop.is_set():
+        while not self.stop.is_set():
+            try:
+                ex = next(self._shared_docs)
+            except StopIteration:
                 break
             txt = (ex.get("text") or "").strip()
             if not txt:
@@ -380,7 +416,7 @@ def main():
 
     is_main = (rank == 0)
 
-    sp = ensure_tokenizer(args)
+    sp = ensure_tokenizer(args, is_main=is_main)
     vocab = sp.vocab_size()
 
     train_stream = StreamingBatcher(
@@ -395,7 +431,7 @@ def main():
     )
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
-    if str(device).startswith("cuda") and platform.system() != "Windows" and not is_distributed:
+    if str(device).startswith("cuda") and platform.system() != "Windows":
         try:
             model = torch.compile(model)
         except Exception:
@@ -471,18 +507,24 @@ def main():
         return local_mean
 
     raw_model = model.module if isinstance(model, DDP) else model
+    # Unwrap torch.compile if present
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
     params = sum(p.numel() for p in raw_model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
+    # Global tokens per step: each rank processes batch_size * context * grad_accum tokens,
+    # and there are world_size ranks training in parallel.
+    tokens_per_step = args.batch_size * args.context * args.grad_accum * world_size
     if is_main:
         print(
-            f"rank={local_rank}/{world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
-            f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} | full-streaming=yes"
+            f"gpus={world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
+            f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} "
+            f"| global_batch={args.batch_size * args.grad_accum * world_size} | full-streaming=yes"
         )
 
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
-    tokens_per_step = args.batch_size * args.context * args.grad_accum
 
     try:
         for step in range(args.train_steps + 1):
@@ -523,13 +565,11 @@ def main():
             last_step_dt = time.perf_counter() - step_start
 
             if step > 0 and step % args.ckpt_every == 0 and is_main:
-                sd = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
-                torch.save({"state_dict": sd, "args": vars(args), "vocab": vocab}, ckpt_path)
+                torch.save({"state_dict": raw_model.state_dict(), "args": vars(args), "vocab": vocab}, ckpt_path)
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
         if is_main:
-            sd = raw_model._orig_mod.state_dict() if hasattr(raw_model, "_orig_mod") else raw_model.state_dict()
-            torch.save({"state_dict": sd, "args": vars(args), "vocab": vocab}, ckpt_path)
+            torch.save({"state_dict": raw_model.state_dict(), "args": vars(args), "vocab": vocab}, ckpt_path)
             print(f"saved -> {ckpt_path}")
     finally:
         train_stream.close()
