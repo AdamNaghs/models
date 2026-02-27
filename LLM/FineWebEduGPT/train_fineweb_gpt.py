@@ -56,6 +56,34 @@ PRESETS = {
         "ckpt_every": 5000,
         "seed_docs": 250000,
     },
+    "a100": {
+        "train_steps": 250000,
+        "batch_size": 24,
+        "context": 2048,
+        "n_layer": 40,
+        "n_head": 40,
+        "n_embd": 3840,
+        "grad_accum": 6,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 250000,
+    },
+    "h100": {
+        "train_steps": 300000,
+        "batch_size": 32,
+        "context": 4096,
+        "n_layer": 48,
+        "n_head": 48,
+        "n_embd": 4608,
+        "grad_accum": 4,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 300000,
+    },
 }
 
 
@@ -90,12 +118,14 @@ def parse_args():
     p.add_argument("--tokenizer-model", default="tokenizer.model")
     p.add_argument("--queue-size", type=int, default=64)
     p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
-    p.add_argument("--preset", choices=["5080", "hpc", "10b"], help="Apply a training preset")
+    p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"], help="Apply a training preset")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("-5080", dest="preset_5080", action="store_true", help="Use RTX 5080-oriented preset")
     g.add_argument("-HPC", dest="preset_hpc", action="store_true", help="Use large HPC preset")
     g.add_argument("-10B", dest="preset_10b", action="store_true", help="Use 10B-target preset")
+    g.add_argument("-A100", dest="preset_a100", action="store_true", help="Use A100 cluster preset")
+    g.add_argument("-H100", dest="preset_h100", action="store_true", help="Use H100 cluster preset")
 
     args = p.parse_args()
 
@@ -105,6 +135,10 @@ def parse_args():
         args.preset = "hpc"
     elif args.preset_10b:
         args.preset = "10b"
+    elif args.preset_a100:
+        args.preset = "a100"
+    elif args.preset_h100:
+        args.preset = "h100"
 
     if args.preset:
         for k, v in PRESETS[args.preset].items():
