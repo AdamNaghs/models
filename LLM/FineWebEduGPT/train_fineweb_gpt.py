@@ -14,6 +14,8 @@ import time
 from collections import deque
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
@@ -724,7 +726,12 @@ class RollingCacheBatcher:
         if self.is_main:
             print(f"cache: loading {len(parquet_files)} parquet files as local dataset...")
 
-        ds = load_dataset("parquet", data_files=parquet_files, split="train")
+        # Read parquet files directly via PyArrow to avoid HF datasets
+        # re-converting them into Arrow format (which doubles disk usage).
+        from datasets import Dataset
+        tables = [pq.read_table(f, columns=["text"]) for f in parquet_files]
+        combined = pa.concat_tables(tables)
+        ds = Dataset(combined)
 
         if self.is_main:
             print(f"cache: chunk loaded — {len(ds):,} documents")
