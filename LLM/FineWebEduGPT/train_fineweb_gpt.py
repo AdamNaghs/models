@@ -444,12 +444,13 @@ class LocalBatcher:
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
-                try:
-                    self.q.put((x, y), timeout=1.0)
-                except queue.Full:
-                    if self.stop.is_set():
-                        break
-                    continue
+                # Retry until the batch is accepted. Do NOT drop it.
+                while not self.stop.is_set():
+                    try:
+                        self.q.put((x, y), timeout=1.0)
+                        break  # success
+                    except queue.Full:
+                        continue  # retry the put, not the outer loop
 
     def next(self, device):
         x, y = self.q.get(timeout=120)
@@ -523,12 +524,12 @@ class StreamingBatcher:
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
-                try:
-                    self.q.put((x, y), timeout=1.0)
-                except queue.Full:
-                    if self.stop.is_set():
+                while not self.stop.is_set():
+                    try:
+                        self.q.put((x, y), timeout=1.0)
                         break
-                    continue
+                    except queue.Full:
+                        continue
 
     def next(self, device):
         x, y = self.q.get(timeout=120)
