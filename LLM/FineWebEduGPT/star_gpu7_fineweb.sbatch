@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=fineweb-h100
-#SBATCH --output=finweb-h100.out
-#SBATCH --error=finweb-h100.err
+#SBATCH --job-name=fineweb-train
+#SBATCH --output=finweb-train.out
+#SBATCH --error=finweb-train.err
 #SBATCH --nodes=1
 #SBATCH --nodelist=gpu7
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 
 # Optional (uncomment if your cluster requires them)
 ##SBATCH --partition=gpu
@@ -32,10 +32,4 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 
 # Multi-GPU launch (single node)
 # Preset options: 5080 | hpc | 10b | a100 | h100
-torchrun \
-  --standalone \
-  --nnodes=1 \
-  --nproc_per_node=8 \
-  train_fineweb_gpt.py \
-  --preset h100 \
-  --config CC-MAIN-2025-26
+torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --cache-gb 500 --eval-every 5 --eval-iters 12 --batch-size 64 --context 1024 --grad-accum 4 --num-workers 8 --queue-size 25
