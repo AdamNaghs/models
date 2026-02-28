@@ -375,6 +375,7 @@ class LocalBatcher:
         self.num_workers = max(1, num_workers)
         self._counter = _AtomicCounter(0)
         self._epoch = 0
+        self._epoch_count = 0  # how many full epochs completed
         self._epoch_lock = threading.Lock()
         self._shuffled_indices = list(self.indices)
         random.Random(seed + rank).shuffle(self._shuffled_indices)
@@ -394,9 +395,14 @@ class LocalBatcher:
     def _advance_epoch(self):
         with self._epoch_lock:
             self._epoch += 1
+            self._epoch_count += 1
             self._shuffled_indices = list(self.indices)
             random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_indices)
             self._counter.reset(0)
+
+    @property
+    def epochs_completed(self):
+        return self._epoch_count
 
     def _run(self):
         token_buf = deque()
@@ -755,20 +761,10 @@ class RollingCacheBatcher:
         return self._inner.next(device)
 
     def rotate_if_needed(self, steps_on_chunk):
-        """Call periodically from training loop to check if chunk is exhausted.
-
-        A simple heuristic: rotate after enough steps that we've likely seen
-        most documents in the chunk at least once.
-        """
-        # Estimate docs consumed: steps * batch_size * grad_accum * context tokens
-        # vs average doc length. Use a simple threshold: rotate after we've
-        # consumed roughly 1 epoch over the chunk.
-        tokens_consumed = steps_on_chunk * self.args.batch_size * self.args.context * self.args.grad_accum
-        # Rough estimate: avg doc is ~500 tokens after SP encoding.
-        docs_per_rank = self._chunk_docs // max(1, self.world_size)
-        tokens_in_chunk = docs_per_rank * 500  # conservative estimate
-
-        if tokens_consumed >= tokens_in_chunk and tokens_in_chunk > 0:
+        """Check if the inner batcher has completed at least one full epoch
+        over the current chunk. This uses actual document consumption tracking
+        rather than token-count heuristics."""
+        if self._inner is not None and self._inner.epochs_completed >= 1:
             return True
         return False
 
