@@ -30,6 +30,45 @@ pip install -r requirements.txt
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 
-# Multi-GPU launch (single node)
-# Preset options: 5080 | hpc | 10b | a100 | h100
-torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --cache-gb 500 --eval-every 5 --eval-iters 12 --batch-size 64 --context 1024 --grad-accum 4 --num-workers 8 --queue-size 25
+# =============================================================================
+# Stage 1: Pretraining
+# =============================================================================
+echo "========== STAGE 1: PRETRAINING =========="
+echo "Start: $(date)"
+
+torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
+    --cache-gb 500 \
+    --eval-every 200 \
+    --eval-iters 12 \
+    --batch-size 64 \
+    --context 1024 \
+    --grad-accum 4 \
+    --num-workers 8 \
+    --queue-size 25
+
+echo "Pretraining finished: $(date)"
+
+# Verify checkpoint exists before proceeding
+if [ ! -f fineweb_gpt.ckpt ]; then
+    echo "ERROR: fineweb_gpt.ckpt not found. Pretraining may have failed."
+    exit 1
+fi
+
+# =============================================================================
+# Stage 2: Chat Finetuning (SFT)
+# =============================================================================
+echo "========== STAGE 2: CHAT FINETUNING =========="
+echo "Start: $(date)"
+
+python finetune_chat.py \
+    --ckpt fineweb_gpt.ckpt \
+    --tok tokenizer.model \
+    --epochs 3 \
+    --batch-size 4 \
+    --grad-accum 8 \
+    --lr 2e-5 \
+    --eval-every 200 \
+    --log-every 10
+
+echo "Finetuning finished: $(date)"
+echo "========== ALL DONE =========="
