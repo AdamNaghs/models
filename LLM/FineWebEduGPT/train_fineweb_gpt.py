@@ -796,11 +796,21 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
         )
 
     if args.cache_gb > 0:
-        if is_main and not is_val:
+        if is_val:
+            # Val doesn't need rolling cache -- just stream a small amount of data.
+            if is_main:
+                print("data(val): using streaming for validation")
+            return StreamingBatcher(
+                sp, args.config, args.context, args.batch_size,
+                queue_size=max(16, args.queue_size // 4),
+                num_workers=max(1, args.num_workers // 4),
+                rank=rank, world_size=world_size,
+            )
+        if is_main:
             print(f"data: rolling cache mode ({args.cache_gb} GB per chunk)")
         return RollingCacheBatcher(
             sp, args, rank=rank, world_size=world_size,
-            is_main=is_main, is_val=is_val,
+            is_main=is_main, is_val=False,
         )
 
     # Full local download mode.
