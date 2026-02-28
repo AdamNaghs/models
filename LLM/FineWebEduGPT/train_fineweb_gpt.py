@@ -153,6 +153,8 @@ def parse_args():
                    help="Download the dataset to local cache and exit (run once before training)")
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint file to resume training from")
+    p.add_argument("--log-every", type=int, default=10,
+                   help="Log training loss every N steps (0 = disabled)")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("-5080", dest="preset_5080", action="store_true")
@@ -196,6 +198,7 @@ def parse_args():
         "queue_size": {"--queue-size"},
         "num_workers": {"--num-workers"},
         "seed_docs": {"--seed-docs"},
+        "log_every": {"--log-every"},
     }
 
     if args.preset:
@@ -207,10 +210,18 @@ def parse_args():
 
 
 def estimate_params(vocab, context, n_embd, n_layer):
+    # Per block: QKV (3*E*E) + proj (E*E) + FFN (8*E*E + 4*E + E) + LN (4*E)
+    # = 12*E*E + 9*E per block (biases on FFN linear1 + linear2 + 2 LN * 2 params)
+    # Actually: FFN has bias on both linears (4E + E = 5E), LN has weight+bias (2*2E = 4E)
+    # QKV no bias, proj no bias. So: 12*E*E + 5*E + 4*E = 12*E*E + 9*E
+    # But nn.Linear default has bias=True for FFN, bias=False for qkv/proj.
+    # FFN: Linear(E, 4E) -> 4E*E + 4E params, Linear(4E, E) -> 4E*E + E params
+    # LN: 2 * (E + E) = 4E
+    # Total per block: 3E^2 + E^2 + 4E^2 + 4E + 4E^2 + E + 4E = 12E^2 + 9E
     return (
         vocab * n_embd
         + context * n_embd
-        + n_layer * (12 * n_embd * n_embd + 13 * n_embd)
+        + n_layer * (12 * n_embd * n_embd + 9 * n_embd)
         # weight tying: output head shares embedding, not counted separately
     )
 
@@ -357,7 +368,7 @@ class LocalBatcher:
     - Zero network I/O (reads from memory-mapped local files).
     - Disjoint per-rank sharding via index arithmetic.
     - Atomic counter ensures no document duplication across worker threads.
-    - Reshuffles each epoch.
+    - Reshuffles each epoch with epoch-versioned safety.
     """
 
     def __init__(self, sp, dataset, context, batch_size, queue_size=256,
@@ -380,7 +391,7 @@ class LocalBatcher:
         self._counter = _AtomicCounter(0)
         self._epoch = 0
         self._epoch_count = 0
-        self._epoch_advancing = threading.Lock()  # only one thread advances
+        self._epoch_lock = threading.Lock()
         self._epoch_id = 0  # monotonic epoch id for dedup
         self._shuffled_indices = list(self.indices)
         random.Random(seed + rank).shuffle(self._shuffled_indices)
@@ -392,23 +403,18 @@ class LocalBatcher:
             self.workers.append(w)
 
     def _get_next_doc_index(self):
+        """Returns (epoch_id, doc_index) or (epoch_id, None) if epoch exhausted."""
+        epoch_id = self._epoch_id
         pos = self._counter.get_and_increment()
         if pos < len(self._shuffled_indices):
-            return self._shuffled_indices[pos]
-        return None
+            return epoch_id, self._shuffled_indices[pos]
+        return epoch_id, None
 
-    def _advance_epoch(self):
-        # Capture current epoch id before acquiring lock.
-        my_epoch = self._epoch_id
-        acquired = self._epoch_advancing.acquire(blocking=False)
-        if not acquired:
-            # Another thread is already advancing. Wait for it to finish,
-            # then return -- the new epoch is ready.
-            with self._epoch_advancing:
-                return
-        try:
-            # Double-check: if epoch already advanced while we waited, bail.
-            if self._epoch_id != my_epoch:
+    def _advance_epoch(self, from_epoch_id):
+        """Advance to next epoch. Only one thread actually advances; others wait."""
+        with self._epoch_lock:
+            # Another thread already advanced past this epoch.
+            if self._epoch_id != from_epoch_id:
                 return
             self._epoch += 1
             self._epoch_count += 1
@@ -416,8 +422,6 @@ class LocalBatcher:
             self._shuffled_indices = list(self.indices)
             random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_indices)
             self._counter.reset(0)
-        finally:
-            self._epoch_advancing.release()
 
     @property
     def epochs_completed(self):
@@ -425,10 +429,16 @@ class LocalBatcher:
 
     def _run(self):
         token_buf = deque()
+        needed = self.batch_size * (self.context + 1)
         while not self.stop.is_set():
-            idx = self._get_next_doc_index()
+            epoch_id, idx = self._get_next_doc_index()
             if idx is None:
-                self._advance_epoch()
+                self._advance_epoch(epoch_id)
+                continue
+
+            # Verify epoch hasn't changed since we got this index.
+            # If it has, the index belongs to the old shuffled list -- discard.
+            if self._epoch_id != epoch_id:
                 continue
 
             txt = (self.dataset[idx].get("text") or "").strip()
@@ -439,9 +449,11 @@ class LocalBatcher:
                 token_buf.extend(ids)
                 token_buf.append(self.eos_id)
 
-            needed = self.batch_size * (self.context + 1)
             while len(token_buf) >= needed and not self.stop.is_set():
-                block = [token_buf.popleft() for _ in range(needed)]
+                # Drain `needed` tokens efficiently using islice.
+                block = list(itertools.islice(token_buf, needed))
+                for _ in range(needed):
+                    token_buf.popleft()
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
@@ -506,6 +518,7 @@ class StreamingBatcher:
 
     def _run(self):
         token_buf = deque()
+        needed = self.batch_size * (self.context + 1)
         while not self.stop.is_set():
             try:
                 ex = next(self._shared_docs)
@@ -519,9 +532,10 @@ class StreamingBatcher:
                 token_buf.extend(ids)
                 token_buf.append(self.eos_id)
 
-            needed = self.batch_size * (self.context + 1)
             while len(token_buf) >= needed and not self.stop.is_set():
-                block = [token_buf.popleft() for _ in range(needed)]
+                block = list(itertools.islice(token_buf, needed))
+                for _ in range(needed):
+                    token_buf.popleft()
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
@@ -548,8 +562,6 @@ class StreamingBatcher:
 # ---------------------------------------------------------------------------
 # Rolling cache: download N GB -> train -> delete -> repeat
 # ---------------------------------------------------------------------------
-
-CACHE_STATE_FILE = "cache_state.json"
 
 
 def _list_parquet_urls(config):
@@ -582,10 +594,12 @@ def _load_cache_state(state_path):
 
 
 def _save_cache_state(state_path, state):
-    """Persist rolling cache progress."""
+    """Persist rolling cache progress (atomic write)."""
     os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
-    with open(state_path, "w") as f:
+    tmp_path = state_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp_path, state_path)
 
 
 def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
@@ -633,10 +647,14 @@ def _clear_cache_data(cache_dir, is_main=True):
         if entry in preserve:
             continue
         path = os.path.join(cache_dir, entry)
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-        else:
-            os.remove(path)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError as e:
+            if is_main:
+                print(f"  warning: could not remove {path}: {e}")
     if is_main:
         print(f"cache: cleared data in {cache_dir}")
 
@@ -645,7 +663,7 @@ class RollingCacheBatcher:
     """Downloads data in chunks, trains on each chunk, then deletes and moves on.
 
     Wraps LocalBatcher internally. Chunk rotation is driven by the training
-    loop calling rotate_if_needed() periodically.
+    loop calling should_rotate() which uses an all-reduce so all ranks agree.
     """
 
     def __init__(self, sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
@@ -655,6 +673,7 @@ class RollingCacheBatcher:
         self.world_size = world_size
         self.is_main = is_main
         self.is_val = is_val
+        self.is_distributed = dist.is_initialized()
         self.cache_dir = args.cache_dir
         self.max_bytes = int(args.cache_gb * 1e9)
         # State file lives outside cache_dir so it survives cache clears.
@@ -677,7 +696,7 @@ class RollingCacheBatcher:
                 json.dump(self._all_shards, f)
             print(f"cache: found {len(self._all_shards)} parquet shards for {args.config}")
 
-        if dist.is_initialized():
+        if self.is_distributed:
             dist.barrier()
 
         if not is_main:
@@ -689,7 +708,7 @@ class RollingCacheBatcher:
         self._state = _load_cache_state(self.state_path) if is_main else {"next_shard_idx": 0}
 
         # Broadcast state from rank 0.
-        if dist.is_initialized():
+        if self.is_distributed:
             if is_main:
                 state_bytes = json.dumps(self._state).encode()
                 state_tensor = torch.tensor(list(state_bytes), dtype=torch.uint8).cuda()
@@ -704,6 +723,7 @@ class RollingCacheBatcher:
                 self._state = json.loads(bytes(state_tensor.tolist()).decode())
 
         self._inner = None
+        self._val_ds = None  # held-out validation slice from first chunk
         self._load_next_chunk()
 
     def _load_next_chunk(self):
@@ -738,7 +758,7 @@ class RollingCacheBatcher:
             with open(count_path, "w") as f:
                 json.dump({"n_shards": n_downloaded, "next_idx": self._state["next_shard_idx"]}, f)
 
-        if dist.is_initialized():
+        if self.is_distributed:
             dist.barrier()
 
         # All ranks: find and load the parquet files directly via PyArrow.
@@ -764,6 +784,16 @@ class RollingCacheBatcher:
                     info = json.load(f)
                     self._state["next_shard_idx"] = info["next_idx"]
 
+        # Reserve 1% of the chunk (min 100 docs) as a local validation set
+        # on the first chunk load. This avoids network-dependent val eval.
+        if self._val_ds is None:
+            n_val = max(100, len(ds) // 100)
+            # Deterministic split: last n_val docs are val.
+            self._val_ds = ds.select(range(len(ds) - n_val, len(ds)))
+            ds = ds.select(range(len(ds) - n_val))
+            if self.is_main:
+                print(f"cache: reserved {n_val:,} docs for validation, {len(ds):,} for training")
+
         self._inner = LocalBatcher(
             self.sp, ds, self.args.context, self.args.batch_size,
             queue_size=self.qsize, num_workers=self.nw,
@@ -772,19 +802,28 @@ class RollingCacheBatcher:
         )
         self._chunk_docs = len(ds)
 
-    def next(self, device):
-        return self._inner.next(device)
+    def should_rotate(self):
+        """Check if rotation is needed, synchronized across all ranks.
+        Returns True on ALL ranks or False on ALL ranks."""
+        local_flag = 1 if (self._inner is not None and self._inner.epochs_completed >= 1) else 0
+        if self.is_distributed:
+            # All-reduce with MIN: rotation only happens when ALL ranks have
+            # completed at least one epoch. This prevents desync.
+            flag_tensor = torch.tensor([local_flag], dtype=torch.int32, device="cuda")
+            dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
+            return flag_tensor.item() >= 1
+        return local_flag >= 1
 
-    def rotate_if_needed(self, steps_on_chunk):
-        """Check if the inner batcher has completed at least one full epoch
-        over the current chunk."""
-        if self._inner is not None and self._inner.epochs_completed >= 1:
-            return True
-        return False
+    def get_val_dataset(self):
+        """Return the held-out validation dataset (for local val batcher)."""
+        return self._val_ds
 
     def load_next_chunk(self):
         """Externally trigger chunk rotation."""
         self._load_next_chunk()
+
+    def next(self, device):
+        return self._inner.next(device)
 
     def close(self):
         if self._inner is not None:
@@ -811,14 +850,9 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 
     if args.cache_gb > 0:
         if is_val:
-            if is_main:
-                print("data(val): using streaming for validation")
-            return StreamingBatcher(
-                sp, args.config, args.context, args.batch_size,
-                queue_size=max(16, args.queue_size // 4),
-                num_workers=max(1, args.num_workers // 4),
-                rank=rank, world_size=world_size,
-            )
+            # Val batcher is created later from the rolling cache's held-out set.
+            # Return None as a sentinel -- caller must handle this.
+            return None
         if is_main:
             print(f"data: rolling cache mode ({args.cache_gb} GB per chunk)")
         return RollingCacheBatcher(
@@ -899,8 +933,34 @@ def main():
 
     train_batcher = make_batcher(sp, args, rank=rank, world_size=world_size,
                                   is_main=is_main, is_val=False)
-    val_batcher = make_batcher(sp, args, rank=rank, world_size=world_size,
-                                is_main=is_main, is_val=True)
+
+    # For rolling cache mode, create val batcher from the held-out set.
+    is_rolling = isinstance(train_batcher, RollingCacheBatcher)
+    if is_rolling:
+        val_ds = train_batcher.get_val_dataset()
+        if val_ds is not None and len(val_ds) > 0:
+            val_batcher = LocalBatcher(
+                sp, val_ds, args.context, args.batch_size,
+                queue_size=max(16, args.queue_size // 4),
+                num_workers=max(1, args.num_workers // 4),
+                rank=rank, world_size=world_size,
+                seed=args.seed + 9999,
+            )
+            if is_main:
+                print(f"data(val): using {len(val_ds):,} held-out docs from cache chunk")
+        else:
+            # Fallback: streaming val if no held-out set available.
+            val_batcher = StreamingBatcher(
+                sp, args.config, args.context, args.batch_size,
+                queue_size=max(16, args.queue_size // 4),
+                num_workers=max(1, args.num_workers // 4),
+                rank=rank, world_size=world_size,
+            )
+            if is_main:
+                print("data(val): fallback to streaming (no held-out set)")
+    else:
+        val_batcher = make_batcher(sp, args, rank=rank, world_size=world_size,
+                                    is_main=is_main, is_val=True)
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
 
@@ -968,6 +1028,11 @@ def main():
             scaler.load_state_dict(_ckpt["scaler_state_dict"])
             if is_main:
                 print("Restored scaler state")
+        # Restore cache state from checkpoint if available.
+        if is_rolling and "cache_next_shard_idx" in _ckpt:
+            restored_idx = _ckpt["cache_next_shard_idx"]
+            if is_main:
+                print(f"Restored cache shard index: {restored_idx}")
         del _ckpt
 
     def get_lr(step):
@@ -1019,20 +1084,30 @@ def main():
             print(f"Resuming from step {start_step}")
 
     def save_checkpoint(path, step):
-        torch.save({
+        """Atomic checkpoint save: write to .tmp then rename."""
+        ckpt_data = {
             "state_dict": raw_model.state_dict(),
             "opt_state_dict": opt.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "args": vars(args),
             "vocab": vocab,
             "step": step,
-        }, path)
+        }
+        # Save cache progress so resume picks up from the right shard.
+        if is_rolling:
+            ckpt_data["cache_next_shard_idx"] = train_batcher._state.get("next_shard_idx", 0)
+        tmp_path = path + ".tmp"
+        torch.save(ckpt_data, tmp_path)
+        os.replace(tmp_path, path)
 
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
-    is_rolling = isinstance(train_batcher, RollingCacheBatcher)
     chunk_step_start = start_step
+
+    # Training loss tracking for logging between eval steps.
+    train_loss_accum = 0.0
+    train_loss_count = 0
 
     # DDP no_sync context: skip gradient all-reduce on non-final microbatches.
     # This avoids (grad_accum - 1) unnecessary NCCL syncs per step.
@@ -1050,7 +1125,8 @@ def main():
             eta = max(args.train_steps - step, 0) * avg_step
 
             # Rolling cache: check if we need to rotate to next chunk.
-            if is_rolling and step > chunk_step_start and train_batcher.rotate_if_needed(step - chunk_step_start):
+            # should_rotate() uses all-reduce so all ranks agree.
+            if is_rolling and step > chunk_step_start and train_batcher.should_rotate():
                 if is_main:
                     print(f"cache: rotating to next chunk at step {step}")
                     save_checkpoint(ckpt_path, step)
@@ -1058,14 +1134,12 @@ def main():
                 # ALL ranks must wait here while rank 0 saves checkpoint.
                 if dist.is_initialized():
                     dist.barrier()
-                # _load_next_chunk has its own internal barrier after download.
                 # Increase NCCL timeout temporarily so the download doesn't
                 # trigger a watchdog kill on waiting ranks.
                 old_timeout = None
                 if dist.is_initialized():
                     pg = dist.distributed_c10d._get_default_group()
                     old_timeout = pg.options._timeout
-                    # 30 minutes should be plenty for even slow downloads.
                     pg.options._timeout = timedelta(minutes=30)
                 train_batcher.load_next_chunk()
                 chunk_step_start = step
@@ -1075,6 +1149,9 @@ def main():
                         pg.options._timeout = old_timeout
 
             if step == start_step or step % args.eval_every == 0:
+                # Sync CUDA before timing eval.
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
                 eval_start = time.perf_counter()
                 v = eval_loss(args.eval_iters)
                 eval_dt = time.perf_counter() - eval_start
@@ -1086,13 +1163,17 @@ def main():
                         f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
                         f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                     )
+                # Reset train loss tracker after eval.
+                train_loss_accum = 0.0
+                train_loss_count = 0
 
             step_start = time.perf_counter()
             cur_lr = get_lr(step)
-            for pg in opt.param_groups:
-                pg["lr"] = cur_lr
+            for param_group in opt.param_groups:
+                param_group["lr"] = cur_lr
             opt.zero_grad(set_to_none=True)
 
+            step_loss = 0.0
             for micro_idx in range(args.grad_accum):
                 xb, yb = train_batcher.next(device)
                 # Only sync gradients on the last microbatch.
@@ -1102,12 +1183,31 @@ def main():
                         _, loss = model(xb, yb)
                         loss = loss / args.grad_accum
                     scaler.scale(loss).backward()
+                step_loss += loss.item()
 
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+
+            # Accurate step timing: sync CUDA before measuring.
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize()
             last_step_dt = time.perf_counter() - step_start
+
+            # Accumulate training loss for periodic logging.
+            train_loss_accum += step_loss
+            train_loss_count += 1
+
+            # Log training loss between eval steps.
+            if args.log_every > 0 and step > 0 and step % args.log_every == 0 and step % args.eval_every != 0:
+                avg_train_loss = train_loss_accum / max(train_loss_count, 1)
+                toks_per_s = (tokens_per_step / last_step_dt) if last_step_dt > 0 else 0.0
+                if is_main:
+                    print(
+                        f"step {step:5d} | train {avg_train_loss:.4f} | "
+                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f}"
+                    )
 
             if step > 0 and step % args.ckpt_every == 0 and is_main:
                 save_checkpoint(ckpt_path, step)
