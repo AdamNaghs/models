@@ -379,7 +379,8 @@ class LocalBatcher:
         self._counter = _AtomicCounter(0)
         self._epoch = 0
         self._epoch_count = 0
-        self._epoch_lock = threading.Lock()
+        self._epoch_advancing = threading.Lock()  # only one thread advances
+        self._epoch_id = 0  # monotonic epoch id for dedup
         self._shuffled_indices = list(self.indices)
         random.Random(seed + rank).shuffle(self._shuffled_indices)
 
@@ -396,20 +397,26 @@ class LocalBatcher:
         return None
 
     def _advance_epoch(self):
-        with self._epoch_lock:
-            # Guard against multiple workers advancing the same epoch.
-            # Check if counter is still past the end (another thread may
-            # have already reset it).
-            if self._counter.get_and_increment() < len(self._shuffled_indices) + self.num_workers:
-                # Another thread already advanced; just return.
-                # (Counter is slightly inflated but will be reset by the
-                # thread that actually wins the advance.)
-                pass
+        # Capture current epoch id before acquiring lock.
+        my_epoch = self._epoch_id
+        acquired = self._epoch_advancing.acquire(blocking=False)
+        if not acquired:
+            # Another thread is already advancing. Wait for it to finish,
+            # then return -- the new epoch is ready.
+            with self._epoch_advancing:
+                return
+        try:
+            # Double-check: if epoch already advanced while we waited, bail.
+            if self._epoch_id != my_epoch:
+                return
             self._epoch += 1
             self._epoch_count += 1
+            self._epoch_id += 1
             self._shuffled_indices = list(self.indices)
             random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_indices)
             self._counter.reset(0)
+        finally:
+            self._epoch_advancing.release()
 
     @property
     def epochs_completed(self):
