@@ -12,8 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager, nullcontext
-from pathlib import Path
+from contextlib import nullcontext
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -625,7 +624,7 @@ def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
 
 def _clear_cache_data(cache_dir, is_main=True):
     """Delete parquet data files but preserve metadata (state, shard list)."""
-    preserve = {CACHE_STATE_FILE, "_shard_list.json", "_chunk_count.json"}
+    preserve = {"_shard_list.json", "_chunk_count.json"}
     if not os.path.exists(cache_dir):
         return
     for entry in os.listdir(cache_dir):
@@ -888,7 +887,8 @@ def main():
 
     if is_distributed:
         backend = "nccl" if str(device).startswith("cuda") else "gloo"
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend,
+                                device_id=torch.device(device) if backend == "nccl" else None)
 
     is_main = (rank == 0)
 
@@ -902,23 +902,26 @@ def main():
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
 
-    # Load checkpoint for resume.
+    # Load checkpoint for resume (model weights loaded here; optimizer/scaler restored after opt creation).
     start_step = 0
+    _ckpt = None
     if args.resume and os.path.exists(args.resume):
         if is_main:
             print(f"Resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["state_dict"])
-        start_step = ckpt.get("step", 0) + 1
+        _ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(_ckpt["state_dict"])
+        start_step = _ckpt.get("step", 0) + 1
         if is_main:
             print(f"Resumed at step {start_step}")
-        del ckpt
 
     if str(device).startswith("cuda") and platform.system() != "Windows":
+        if is_main:
+            print("Compiling model with torch.compile (this takes 60-120s on first run)...")
         try:
             model = torch.compile(model)
         except Exception:
-            pass
+            if is_main:
+                print("torch.compile failed, continuing without compilation")
 
     if is_distributed:
         ddp_device_ids = [local_rank] if str(device).startswith("cuda") else None
@@ -952,6 +955,18 @@ def main():
         )
 
     scaler = torch.amp.GradScaler("cuda", enabled=str(device).startswith("cuda"))
+
+    # Restore optimizer and scaler state from checkpoint.
+    if _ckpt is not None:
+        if "opt_state_dict" in _ckpt:
+            opt.load_state_dict(_ckpt["opt_state_dict"])
+            if is_main:
+                print("Restored optimizer state")
+        if "scaler_state_dict" in _ckpt:
+            scaler.load_state_dict(_ckpt["scaler_state_dict"])
+            if is_main:
+                print("Restored scaler state")
+        del _ckpt
 
     def get_lr(step):
         if step < args.warmup_steps:
@@ -1001,6 +1016,16 @@ def main():
         if start_step > 0:
             print(f"Resuming from step {start_step}")
 
+    def save_checkpoint(path, step):
+        torch.save({
+            "state_dict": raw_model.state_dict(),
+            "opt_state_dict": opt.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "args": vars(args),
+            "vocab": vocab,
+            "step": step,
+        }, path)
+
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
@@ -1026,8 +1051,7 @@ def main():
             if is_rolling and step > chunk_step_start and train_batcher.rotate_if_needed(step - chunk_step_start):
                 if is_main:
                     print(f"cache: rotating to next chunk at step {step}")
-                    torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
-                                "vocab": vocab, "step": step}, ckpt_path)
+                    save_checkpoint(ckpt_path, step)
                     print(f"checkpoint -> {ckpt_path} (pre-rotation)")
                 if dist.is_initialized():
                     dist.barrier()
@@ -1072,13 +1096,11 @@ def main():
             last_step_dt = time.perf_counter() - step_start
 
             if step > 0 and step % args.ckpt_every == 0 and is_main:
-                torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
-                            "vocab": vocab, "step": step}, ckpt_path)
+                save_checkpoint(ckpt_path, step)
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
         if is_main:
-            torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
-                        "vocab": vocab, "step": args.train_steps}, ckpt_path)
+            save_checkpoint(ckpt_path, args.train_steps)
             print(f"saved -> {ckpt_path}")
     finally:
         train_batcher.close()
