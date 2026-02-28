@@ -10,19 +10,45 @@ import torch.nn.functional as F
 class Block(nn.Module):
     def __init__(self, n_embd, n_head, dropout):
         super().__init__()
+        assert n_embd % n_head == 0
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-        self.attn = nn.MultiheadAttention(n_embd, n_head, dropout=dropout, batch_first=True)
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
         self.ff = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
-        t = x.size(1)
-        m = torch.triu(torch.ones(t, t, device=x.device), diagonal=1).bool()
-        x = x + self.attn(self.ln1(x), self.ln1(x), self.ln1(x), attn_mask=m, need_weights=False)[0]
+        b, t, c = x.size()
+        x_norm = self.ln1(x)
+        qkv = self.qkv(x_norm)
+        q, k, v = qkv.split(c, dim=2)
+        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        if x.is_cuda:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            m = torch.triu(torch.ones(t, t, device=x.device), diagonal=1).bool()
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=m,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=False,
+            )
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        x = x + self.resid_drop(self.proj(y))
         return x + self.ff(self.ln2(x))
 
 
@@ -35,6 +61,7 @@ class GPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout) for _ in range(n_layer)])
         self.ln = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab, bias=False)
+        self.head.weight = self.tok.weight
 
     def forward(self, idx):
         _, t = idx.shape
