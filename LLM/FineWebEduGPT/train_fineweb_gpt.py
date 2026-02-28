@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import argparse
 import glob
 import itertools
@@ -1053,12 +1055,24 @@ def main():
                     print(f"cache: rotating to next chunk at step {step}")
                     save_checkpoint(ckpt_path, step)
                     print(f"checkpoint -> {ckpt_path} (pre-rotation)")
+                # ALL ranks must wait here while rank 0 saves checkpoint.
                 if dist.is_initialized():
                     dist.barrier()
+                # _load_next_chunk has its own internal barrier after download.
+                # Increase NCCL timeout temporarily so the download doesn't
+                # trigger a watchdog kill on waiting ranks.
+                old_timeout = None
+                if dist.is_initialized():
+                    pg = dist.distributed_c10d._get_default_group()
+                    old_timeout = pg.options._timeout
+                    # 30 minutes should be plenty for even slow downloads.
+                    pg.options._timeout = timedelta(minutes=30)
                 train_batcher.load_next_chunk()
                 chunk_step_start = step
                 if dist.is_initialized():
                     dist.barrier()
+                    if old_timeout is not None:
+                        pg.options._timeout = old_timeout
 
             if step == start_step or step % args.eval_every == 0:
                 eval_start = time.perf_counter()
