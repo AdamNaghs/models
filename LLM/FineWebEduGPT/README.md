@@ -62,6 +62,8 @@ python train_fineweb_gpt.py --preset h100
 ```bash
 ./launch_torchrun.sh h100 8
 ./launch_torchrun.sh a100 4
+
+torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --cache-gb 5 --eval-every 5 --eval-iters 12 --batch-size 64 --context 1024 --grad-accum 4 --num-workers 8 --queue-size 256 --resume fineweb_gpt.ckpt
 ```
 
 Arguments are:
