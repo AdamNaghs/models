@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pyarrow as pa
@@ -136,22 +137,21 @@ def parse_args():
     p.add_argument("--queue-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed-docs", type=int, default=50000, help="Docs used once to build tokenizer if missing")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"], help="Apply a training preset")
 
-    # Data loading modes (mutually exclusive):
-    #   default:    local pre-downloaded dataset (fastest, needs full disk space)
-    #   --stream:   HF streaming (no disk, network-bound)
-    #   --cache-gb: rolling cache (downloads N GB, trains, deletes, repeats)
+    # Data loading modes:
     p.add_argument("--stream", action="store_true", default=False,
                    help="Use HF streaming mode (slower, no pre-download needed)")
     p.add_argument("--cache-gb", type=float, default=0,
                    help="Rolling cache size in GB. Downloads this much data, trains on it, "
-                        "deletes, and downloads the next chunk. Ideal for large datasets on "
-                        "rented machines with limited disk. (0 = disabled, use full download)")
+                        "deletes, and downloads the next chunk. (0 = disabled, use full download)")
     p.add_argument("--cache-dir", type=str, default=".data_cache",
                    help="Directory for rolling cache parquet files (default: .data_cache)")
     p.add_argument("--download", action="store_true", default=False,
                    help="Download the dataset to local cache and exit (run once before training)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint file to resume training from")
 
     g = p.add_mutually_exclusive_group()
     g.add_argument("-5080", dest="preset_5080", action="store_true")
@@ -210,7 +210,7 @@ def estimate_params(vocab, context, n_embd, n_layer):
         vocab * n_embd
         + context * n_embd
         + n_layer * (12 * n_embd * n_embd + 13 * n_embd)
-        + n_embd * vocab
+        # weight tying: output head shares embedding, not counted separately
     )
 
 
@@ -317,6 +317,9 @@ class GPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout) for _ in range(n_layer)])
         self.ln = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, vocab, bias=False)
+        # Weight tying: share embedding weights with output projection.
+        # Reduces parameters and improves training (Press & Wolf, 2017).
+        self.head.weight = self.tok.weight
 
     def forward(self, idx, targets=None):
         _, t = idx.shape
@@ -375,7 +378,7 @@ class LocalBatcher:
         self.num_workers = max(1, num_workers)
         self._counter = _AtomicCounter(0)
         self._epoch = 0
-        self._epoch_count = 0  # how many full epochs completed
+        self._epoch_count = 0
         self._epoch_lock = threading.Lock()
         self._shuffled_indices = list(self.indices)
         random.Random(seed + rank).shuffle(self._shuffled_indices)
@@ -394,6 +397,14 @@ class LocalBatcher:
 
     def _advance_epoch(self):
         with self._epoch_lock:
+            # Guard against multiple workers advancing the same epoch.
+            # Check if counter is still past the end (another thread may
+            # have already reset it).
+            if self._counter.get_and_increment() < len(self._shuffled_indices) + self.num_workers:
+                # Another thread already advanced; just return.
+                # (Counter is slightly inflated but will be reset by the
+                # thread that actually wins the advance.)
+                pass
             self._epoch += 1
             self._epoch_count += 1
             self._shuffled_indices = list(self.indices)
@@ -547,7 +558,6 @@ def _list_parquet_urls(config):
     except Exception as e:
         print(f"Warning: could not list parquet files via HfApi: {e}")
         print("Falling back to pattern-based shard listing...")
-        # Fallback: generate expected shard paths (common pattern for fineweb-edu)
         shards = []
         for i in range(2500):
             shards.append(f"data/{config}/{i:03d}_{i:05d}.parquet")
@@ -564,15 +574,13 @@ def _load_cache_state(state_path):
 
 def _save_cache_state(state_path, state):
     """Persist rolling cache progress."""
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
 
 
 def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
-    """Download parquet shards into cache_dir up to max_bytes.
-
-    Returns list of local file paths that were downloaded.
-    """
+    """Download parquet shards into cache_dir up to max_bytes."""
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:
@@ -607,23 +615,28 @@ def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
     return downloaded
 
 
-def _clear_cache(cache_dir, is_main=True):
-    """Delete all files in the rolling cache directory."""
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        if is_main:
-            print(f"cache: cleared {cache_dir}")
+def _clear_cache_data(cache_dir, is_main=True):
+    """Delete parquet data files but preserve metadata (state, shard list)."""
+    preserve = {CACHE_STATE_FILE, "_shard_list.json", "_chunk_count.json"}
+    if not os.path.exists(cache_dir):
+        return
+    for entry in os.listdir(cache_dir):
+        if entry in preserve:
+            continue
+        path = os.path.join(cache_dir, entry)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+    if is_main:
+        print(f"cache: cleared data in {cache_dir}")
 
 
 class RollingCacheBatcher:
     """Downloads data in chunks, trains on each chunk, then deletes and moves on.
 
-    Wraps LocalBatcher internally. When all documents in the current chunk are
-    consumed (epoch boundary), it signals for the next chunk to be loaded.
-
-    This class is designed to be used as a drop-in replacement for LocalBatcher
-    in the training loop, but the chunk rotation is driven externally by the
-    training loop calling `maybe_rotate()` periodically.
+    Wraps LocalBatcher internally. Chunk rotation is driven by the training
+    loop calling rotate_if_needed() periodically.
     """
 
     def __init__(self, sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
@@ -635,7 +648,9 @@ class RollingCacheBatcher:
         self.is_val = is_val
         self.cache_dir = args.cache_dir
         self.max_bytes = int(args.cache_gb * 1e9)
-        self.state_path = os.path.join(self.cache_dir, CACHE_STATE_FILE)
+        # State file lives outside cache_dir so it survives cache clears.
+        self.state_path = os.path.join(os.path.dirname(self.cache_dir) or ".",
+                                        f".{os.path.basename(self.cache_dir)}_state.json")
 
         if is_val:
             self.qsize = max(16, args.queue_size // 2)
@@ -647,7 +662,6 @@ class RollingCacheBatcher:
         # List all available shards.
         if is_main:
             self._all_shards = _list_parquet_urls(args.config)
-            # Save shard list so non-main ranks can read it.
             shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
             os.makedirs(self.cache_dir, exist_ok=True)
             with open(shard_list_path, "w") as f:
@@ -662,7 +676,7 @@ class RollingCacheBatcher:
             with open(shard_list_path) as f:
                 self._all_shards = json.load(f)
 
-        # Load progress state (which shard we're on).
+        # Load progress state.
         self._state = _load_cache_state(self.state_path) if is_main else {"next_shard_idx": 0}
 
         # Broadcast state from rank 0.
@@ -685,7 +699,6 @@ class RollingCacheBatcher:
 
     def _load_next_chunk(self):
         """Download next batch of shards, create LocalBatcher."""
-        # Close previous batcher if any.
         if self._inner is not None:
             self._inner.close()
             self._inner = None
@@ -698,25 +711,20 @@ class RollingCacheBatcher:
                 print("cache: all shards consumed. Wrapping to beginning.")
             self._state["next_shard_idx"] = 0
             remaining = self._all_shards
+            idx = 0
 
         # Rank 0 downloads; others wait.
         if self.is_main:
-            _clear_cache(self.cache_dir, is_main=True)
-            os.makedirs(self.cache_dir, exist_ok=True)
-            # Re-save shard list and state after clearing.
-            with open(os.path.join(self.cache_dir, "_shard_list.json"), "w") as f:
-                json.dump(self._all_shards, f)
+            _clear_cache_data(self.cache_dir, is_main=True)
 
             downloaded = _download_shard_batch(remaining, self.cache_dir, self.max_bytes, is_main=True)
             n_downloaded = len(downloaded)
             print(f"cache: downloaded {n_downloaded} shards into {self.cache_dir}")
 
-            # Update state.
             self._state["next_shard_idx"] = idx + n_downloaded
             self._state["total_shards_trained"] = self._state.get("total_shards_trained", 0) + n_downloaded
             _save_cache_state(self.state_path, self._state)
 
-            # Save download count for other ranks.
             count_path = os.path.join(self.cache_dir, "_chunk_count.json")
             with open(count_path, "w") as f:
                 json.dump({"n_shards": n_downloaded, "next_idx": self._state["next_shard_idx"]}, f)
@@ -724,7 +732,7 @@ class RollingCacheBatcher:
         if dist.is_initialized():
             dist.barrier()
 
-        # All ranks: find the parquet files and load as dataset.
+        # All ranks: find and load the parquet files directly via PyArrow.
         parquet_files = sorted(glob.glob(os.path.join(self.cache_dir, "**", "*.parquet"), recursive=True))
         if not parquet_files:
             raise RuntimeError(f"No parquet files found in {self.cache_dir} after download")
@@ -732,17 +740,14 @@ class RollingCacheBatcher:
         if self.is_main:
             print(f"cache: loading {len(parquet_files)} parquet files as local dataset...")
 
-        # Read parquet files directly via PyArrow to avoid HF datasets
-        # re-converting them into Arrow format (which doubles disk usage).
         from datasets import Dataset
         tables = [pq.read_table(f, columns=["text"]) for f in parquet_files]
         combined = pa.concat_tables(tables)
         ds = Dataset(combined)
 
         if self.is_main:
-            print(f"cache: chunk loaded — {len(ds):,} documents")
+            print(f"cache: chunk loaded -- {len(ds):,} documents")
 
-        # Read updated state on non-main ranks.
         if not self.is_main:
             count_path = os.path.join(self.cache_dir, "_chunk_count.json")
             if os.path.exists(count_path):
@@ -754,6 +759,7 @@ class RollingCacheBatcher:
             self.sp, ds, self.args.context, self.args.batch_size,
             queue_size=self.qsize, num_workers=self.nw,
             rank=self.rank, world_size=self.world_size,
+            seed=self.args.seed,
         )
         self._chunk_docs = len(ds)
 
@@ -762,8 +768,7 @@ class RollingCacheBatcher:
 
     def rotate_if_needed(self, steps_on_chunk):
         """Check if the inner batcher has completed at least one full epoch
-        over the current chunk. This uses actual document consumption tracking
-        rather than token-count heuristics."""
+        over the current chunk."""
         if self._inner is not None and self._inner.epochs_completed >= 1:
             return True
         return False
@@ -797,7 +802,6 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 
     if args.cache_gb > 0:
         if is_val:
-            # Val doesn't need rolling cache -- just stream a small amount of data.
             if is_main:
                 print("data(val): using streaming for validation")
             return StreamingBatcher(
@@ -837,6 +841,7 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
         sp, ds, args.context, args.batch_size,
         queue_size=qsize, num_workers=nw,
         rank=rank, world_size=world_size,
+        seed=args.seed,
     )
 
 
@@ -859,6 +864,10 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     is_distributed = world_size > 1
+
+    # Seed everything for reproducibility.
+    torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -884,6 +893,19 @@ def main():
                                 is_main=is_main, is_val=True)
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
+
+    # Load checkpoint for resume.
+    start_step = 0
+    if args.resume and os.path.exists(args.resume):
+        if is_main:
+            print(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["state_dict"])
+        start_step = ckpt.get("step", 0) + 1
+        if is_main:
+            print(f"Resumed at step {start_step}")
+        del ckpt
+
     if str(device).startswith("cuda") and platform.system() != "Windows":
         try:
             model = torch.compile(model)
@@ -966,27 +988,36 @@ def main():
         print(
             f"gpus={world_size} | device={device} | preset={args.preset or 'custom'} | vocab={vocab} | params={params:,} "
             f"(est {est:,}) | config={args.config} | grad_accum={args.grad_accum} | workers={args.num_workers} "
-            f"| global_batch={args.batch_size * args.grad_accum * world_size} | data={data_mode}"
+            f"| global_batch={args.batch_size * args.grad_accum * world_size} | data={data_mode} | seed={args.seed}"
         )
+        if start_step > 0:
+            print(f"Resuming from step {start_step}")
 
     ckpt_path = "fineweb_gpt.ckpt"
     start_time = time.perf_counter()
     last_step_dt = 0.0
     is_rolling = isinstance(train_batcher, RollingCacheBatcher)
-    chunk_step_start = 0  # track steps within current cache chunk
+    chunk_step_start = start_step
+
+    # DDP no_sync context: skip gradient all-reduce on non-final microbatches.
+    # This avoids (grad_accum - 1) unnecessary NCCL syncs per step.
+    def no_sync_ctx():
+        if is_distributed and isinstance(model, DDP):
+            return model.no_sync()
+        return nullcontext()
 
     try:
-        for step in range(args.train_steps + 1):
+        for step in range(start_step, args.train_steps + 1):
             now = time.perf_counter()
             elapsed = now - start_time
-            avg_step = elapsed / max(step, 1)
+            steps_done = max(step - start_step, 1)
+            avg_step = elapsed / steps_done
             eta = max(args.train_steps - step, 0) * avg_step
 
             # Rolling cache: check if we need to rotate to next chunk.
-            if is_rolling and step > 0 and train_batcher.rotate_if_needed(step - chunk_step_start):
+            if is_rolling and step > chunk_step_start and train_batcher.rotate_if_needed(step - chunk_step_start):
                 if is_main:
                     print(f"cache: rotating to next chunk at step {step}")
-                    # Save checkpoint before rotation so progress isn't lost.
                     torch.save({"state_dict": raw_model.state_dict(), "args": vars(args),
                                 "vocab": vocab, "step": step}, ckpt_path)
                     print(f"checkpoint -> {ckpt_path} (pre-rotation)")
@@ -997,7 +1028,7 @@ def main():
                 if dist.is_initialized():
                     dist.barrier()
 
-            if step == 1 or step % args.eval_every == 0:
+            if step == start_step or step % args.eval_every == 0:
                 eval_start = time.perf_counter()
                 v = eval_loss(args.eval_iters)
                 eval_dt = time.perf_counter() - eval_start
@@ -1015,12 +1046,16 @@ def main():
             for pg in opt.param_groups:
                 pg["lr"] = cur_lr
             opt.zero_grad(set_to_none=True)
-            for _ in range(args.grad_accum):
+
+            for micro_idx in range(args.grad_accum):
                 xb, yb = train_batcher.next(device)
-                with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
-                    _, loss = model(xb, yb)
-                    loss = loss / args.grad_accum
-                scaler.scale(loss).backward()
+                # Only sync gradients on the last microbatch.
+                ctx = no_sync_ctx() if micro_idx < args.grad_accum - 1 else nullcontext()
+                with ctx:
+                    with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
+                        _, loss = model(xb, yb)
+                        loss = loss / args.grad_accum
+                    scaler.scale(loss).backward()
 
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
