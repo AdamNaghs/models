@@ -9,6 +9,7 @@ import os
 import platform
 import queue
 import random
+import signal
 import shutil
 import sys
 import threading
@@ -102,6 +103,14 @@ PRESETS = {
 
 
 HF_DATASET = "HuggingFaceFW/fineweb-edu"
+
+# Global shutdown event for graceful SIGTERM/SIGINT handling.
+_shutdown = threading.Event()
+
+
+def _signal_handler(signum, frame):
+    """Set shutdown event on SIGTERM/SIGINT so worker threads drain cleanly."""
+    _shutdown.set()
 
 
 def parse_args():
@@ -210,14 +219,8 @@ def parse_args():
 
 
 def estimate_params(vocab, context, n_embd, n_layer):
-    # Per block: QKV (3*E*E) + proj (E*E) + FFN (8*E*E + 4*E + E) + LN (4*E)
-    # = 12*E*E + 9*E per block (biases on FFN linear1 + linear2 + 2 LN * 2 params)
-    # Actually: FFN has bias on both linears (4E + E = 5E), LN has weight+bias (2*2E = 4E)
-    # QKV no bias, proj no bias. So: 12*E*E + 5*E + 4*E = 12*E*E + 9*E
-    # But nn.Linear default has bias=True for FFN, bias=False for qkv/proj.
-    # FFN: Linear(E, 4E) -> 4E*E + 4E params, Linear(4E, E) -> 4E*E + E params
-    # LN: 2 * (E + E) = 4E
-    # Total per block: 3E^2 + E^2 + 4E^2 + 4E + 4E^2 + E + 4E = 12E^2 + 9E
+    # Per block: QKV (3E^2) + proj (E^2) + FFN (4E^2+4E + 4E^2+E) + LN (2*(E+E))
+    # = 12E^2 + 9E per block
     return (
         vocab * n_embd
         + context * n_embd
@@ -291,6 +294,8 @@ class Block(nn.Module):
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
+        # Cached causal mask for CPU fallback path. Lazily created.
+        self._cpu_mask_cache: dict[int, torch.Tensor] = {}
 
     def forward(self, x):
         b, t, c = x.size()
@@ -308,7 +313,13 @@ class Block(nn.Module):
                 is_causal=True,
             )
         else:
-            m = torch.triu(torch.ones(t, t, device=x.device), diagonal=1).bool()
+            # Cache the causal mask by sequence length to avoid recreating it
+            # every forward pass on CPU.
+            if t not in self._cpu_mask_cache:
+                self._cpu_mask_cache[t] = torch.triu(
+                    torch.ones(t, t, device=x.device), diagonal=1
+                ).bool()
+            m = self._cpu_mask_cache[t]
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=m,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
@@ -369,6 +380,7 @@ class LocalBatcher:
     - Disjoint per-rank sharding via index arithmetic.
     - Atomic counter ensures no document duplication across worker threads.
     - Reshuffles each epoch with epoch-versioned safety.
+    - Respects global _shutdown event for graceful SIGTERM handling.
     """
 
     def __init__(self, sp, dataset, context, batch_size, queue_size=256,
@@ -402,6 +414,9 @@ class LocalBatcher:
             w.start()
             self.workers.append(w)
 
+    def _should_stop(self):
+        return self.stop.is_set() or _shutdown.is_set()
+
     def _get_next_doc_index(self):
         """Returns (epoch_id, doc_index) or (epoch_id, None) if epoch exhausted."""
         epoch_id = self._epoch_id
@@ -413,7 +428,6 @@ class LocalBatcher:
     def _advance_epoch(self, from_epoch_id):
         """Advance to next epoch. Only one thread actually advances; others wait."""
         with self._epoch_lock:
-            # Another thread already advanced past this epoch.
             if self._epoch_id != from_epoch_id:
                 return
             self._epoch += 1
@@ -430,14 +444,13 @@ class LocalBatcher:
     def _run(self):
         token_buf = deque()
         needed = self.batch_size * (self.context + 1)
-        while not self.stop.is_set():
+        while not self._should_stop():
             epoch_id, idx = self._get_next_doc_index()
             if idx is None:
                 self._advance_epoch(epoch_id)
                 continue
 
             # Verify epoch hasn't changed since we got this index.
-            # If it has, the index belongs to the old shuffled list -- discard.
             if self._epoch_id != epoch_id:
                 continue
 
@@ -449,21 +462,19 @@ class LocalBatcher:
                 token_buf.extend(ids)
                 token_buf.append(self.eos_id)
 
-            while len(token_buf) >= needed and not self.stop.is_set():
-                # Drain `needed` tokens efficiently using islice.
+            while len(token_buf) >= needed and not self._should_stop():
                 block = list(itertools.islice(token_buf, needed))
                 for _ in range(needed):
                     token_buf.popleft()
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
-                # Retry until the batch is accepted. Do NOT drop it.
-                while not self.stop.is_set():
+                while not self._should_stop():
                     try:
                         self.q.put((x, y), timeout=1.0)
-                        break  # success
+                        break
                     except queue.Full:
-                        continue  # retry the put, not the outer loop
+                        continue
 
     def next(self, device):
         x, y = self.q.get(timeout=120)
@@ -516,10 +527,13 @@ class StreamingBatcher:
             w.start()
             self.workers.append(w)
 
+    def _should_stop(self):
+        return self.stop.is_set() or _shutdown.is_set()
+
     def _run(self):
         token_buf = deque()
         needed = self.batch_size * (self.context + 1)
-        while not self.stop.is_set():
+        while not self._should_stop():
             try:
                 ex = next(self._shared_docs)
             except StopIteration:
@@ -532,14 +546,14 @@ class StreamingBatcher:
                 token_buf.extend(ids)
                 token_buf.append(self.eos_id)
 
-            while len(token_buf) >= needed and not self.stop.is_set():
+            while len(token_buf) >= needed and not self._should_stop():
                 block = list(itertools.islice(token_buf, needed))
                 for _ in range(needed):
                     token_buf.popleft()
                 t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
                 x = t[:, :-1].contiguous()
                 y = t[:, 1:].contiguous()
-                while not self.stop.is_set():
+                while not self._should_stop():
                     try:
                         self.q.put((x, y), timeout=1.0)
                         break
@@ -565,7 +579,12 @@ class StreamingBatcher:
 
 
 def _list_parquet_urls(config):
-    """List all parquet file URLs for a FineWeb-Edu config via HF Hub API."""
+    """List all parquet file URLs for a FineWeb-Edu config via HF Hub API.
+
+    Falls back to listing the repo tree with HfApi.list_repo_tree().
+    If that also fails, raises RuntimeError -- we do NOT guess shard names
+    because HuggingFace naming conventions vary by dataset and config.
+    """
     try:
         from huggingface_hub import HfApi
         api = HfApi()
@@ -575,14 +594,17 @@ def _list_parquet_urls(config):
             if hasattr(f, "rfilename") and f.rfilename.endswith(".parquet"):
                 urls.append(f.rfilename)
         urls.sort()
+        if not urls:
+            raise RuntimeError(
+                f"No parquet files found for config '{config}' in {HF_DATASET}. "
+                f"Check that the config name is correct and you have network access."
+            )
         return urls
-    except Exception as e:
-        print(f"Warning: could not list parquet files via HfApi: {e}")
-        print("Falling back to pattern-based shard listing...")
-        shards = []
-        for i in range(2500):
-            shards.append(f"data/{config}/{i:03d}_{i:05d}.parquet")
-        return shards
+    except ImportError:
+        raise RuntimeError(
+            "huggingface_hub is required for --cache-gb mode. "
+            "Install with: pip install huggingface_hub"
+        )
 
 
 def _load_cache_state(state_path):
@@ -604,11 +626,7 @@ def _save_cache_state(state_path, state):
 
 def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
     """Download parquet shards into cache_dir up to max_bytes."""
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        raise ImportError("huggingface_hub is required for --cache-gb mode. "
-                          "Install with: pip install huggingface_hub")
+    from huggingface_hub import hf_hub_download
 
     os.makedirs(cache_dir, exist_ok=True)
     downloaded = []
@@ -788,7 +806,6 @@ class RollingCacheBatcher:
         # on the first chunk load. This avoids network-dependent val eval.
         if self._val_ds is None:
             n_val = max(100, len(ds) // 100)
-            # Deterministic split: last n_val docs are val.
             self._val_ds = ds.select(range(len(ds) - n_val, len(ds)))
             ds = ds.select(range(len(ds) - n_val))
             if self.is_main:
@@ -807,8 +824,6 @@ class RollingCacheBatcher:
         Returns True on ALL ranks or False on ALL ranks."""
         local_flag = 1 if (self._inner is not None and self._inner.epochs_completed >= 1) else 0
         if self.is_distributed:
-            # All-reduce with MIN: rotation only happens when ALL ranks have
-            # completed at least one epoch. This prevents desync.
             flag_tensor = torch.tensor([local_flag], dtype=torch.int32, device="cuda")
             dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
             return flag_tensor.item() >= 1
@@ -850,8 +865,7 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 
     if args.cache_gb > 0:
         if is_val:
-            # Val batcher is created later from the rolling cache's held-out set.
-            # Return None as a sentinel -- caller must handle this.
+            # Val batcher created later from the rolling cache's held-out set.
             return None
         if is_main:
             print(f"data: rolling cache mode ({args.cache_gb} GB per chunk)")
@@ -861,12 +875,8 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
         )
 
     # Full local download mode.
-    if is_val:
-        qsize = max(16, args.queue_size // 2)
-        nw = max(1, args.num_workers // 2)
-    else:
-        qsize = args.queue_size
-        nw = args.num_workers
+    qsize = (max(16, args.queue_size // 2) if is_val else args.queue_size)
+    nw = (max(1, args.num_workers // 2) if is_val else args.num_workers)
 
     ds = None
     if is_main:
@@ -893,6 +903,10 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 # ---------------------------------------------------------------------------
 
 def main():
+    # Install signal handlers for graceful shutdown before any GPU/NCCL init.
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     args = parse_args()
 
     # Download-only mode.
@@ -907,12 +921,13 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     is_distributed = world_size > 1
+    is_cuda = torch.cuda.is_available()
 
     # Seed everything for reproducibility.
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
 
-    if torch.cuda.is_available():
+    if is_cuda:
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
         torch.set_float32_matmul_precision("high")
@@ -922,7 +937,7 @@ def main():
         device = "cpu"
 
     if is_distributed:
-        backend = "nccl" if str(device).startswith("cuda") else "gloo"
+        backend = "nccl" if is_cuda else "gloo"
         dist.init_process_group(backend=backend,
                                 device_id=torch.device(device) if backend == "nccl" else None)
 
@@ -949,7 +964,6 @@ def main():
             if is_main:
                 print(f"data(val): using {len(val_ds):,} held-out docs from cache chunk")
         else:
-            # Fallback: streaming val if no held-out set available.
             val_batcher = StreamingBatcher(
                 sp, args.config, args.context, args.batch_size,
                 queue_size=max(16, args.queue_size // 4),
@@ -964,7 +978,7 @@ def main():
 
     model = GPT(vocab, args.context, args.n_embd, args.n_head, args.n_layer, args.dropout).to(device)
 
-    # Load checkpoint for resume (model weights loaded here; optimizer/scaler restored after opt creation).
+    # Load checkpoint for resume.
     start_step = 0
     _ckpt = None
     if args.resume and os.path.exists(args.resume):
@@ -976,7 +990,7 @@ def main():
         if is_main:
             print(f"Resumed at step {start_step}")
 
-    if str(device).startswith("cuda") and platform.system() != "Windows":
+    if is_cuda and platform.system() != "Windows":
         if is_main:
             print("Compiling model with torch.compile (this takes 60-120s on first run)...")
         try:
@@ -986,11 +1000,11 @@ def main():
                 print("torch.compile failed, continuing without compilation")
 
     if is_distributed:
-        ddp_device_ids = [local_rank] if str(device).startswith("cuda") else None
+        ddp_device_ids = [local_rank] if is_cuda else None
         model = DDP(model, device_ids=ddp_device_ids)
 
     opt = None
-    if str(device).startswith("cuda"):
+    if is_cuda:
         try:
             if is_main:
                 print("Optimizing with AdamW fused")
@@ -1016,7 +1030,7 @@ def main():
             weight_decay=args.weight_decay,
         )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=str(device).startswith("cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
 
     # Restore optimizer and scaler state from checkpoint.
     if _ckpt is not None:
@@ -1028,11 +1042,9 @@ def main():
             scaler.load_state_dict(_ckpt["scaler_state_dict"])
             if is_main:
                 print("Restored scaler state")
-        # Restore cache state from checkpoint if available.
         if is_rolling and "cache_next_shard_idx" in _ckpt:
-            restored_idx = _ckpt["cache_next_shard_idx"]
             if is_main:
-                print(f"Restored cache shard index: {restored_idx}")
+                print(f"Restored cache shard index: {_ckpt['cache_next_shard_idx']}")
         del _ckpt
 
     def get_lr(step):
@@ -1049,7 +1061,7 @@ def main():
         vals = []
         for _ in range(iters):
             xb, yb = val_batcher.next(device)
-            with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
+            with torch.amp.autocast("cuda", enabled=is_cuda):
                 _, loss = model(xb, yb)
             vals.append(loss.item())
         local_mean = sum(vals) / len(vals)
@@ -1084,7 +1096,13 @@ def main():
             print(f"Resuming from step {start_step}")
 
     def save_checkpoint(path, step):
-        """Atomic checkpoint save: write to .tmp then rename."""
+        """Atomic checkpoint save: write to .tmp then os.replace.
+
+        NOTE: Only called on rank 0 (is_main). Optimizer state is from rank 0
+        only -- resuming on a different world_size will load rank-0 optimizer
+        state onto all ranks, which is fine for AdamW (per-param, no cross-rank
+        state) but the LR scheduler step count should be verified.
+        """
         ckpt_data = {
             "state_dict": raw_model.state_dict(),
             "opt_state_dict": opt.state_dict(),
@@ -1093,7 +1111,6 @@ def main():
             "vocab": vocab,
             "step": step,
         }
-        # Save cache progress so resume picks up from the right shard.
         if is_rolling:
             ckpt_data["cache_next_shard_idx"] = train_batcher._state.get("next_shard_idx", 0)
         tmp_path = path + ".tmp"
@@ -1109,8 +1126,6 @@ def main():
     train_loss_accum = 0.0
     train_loss_count = 0
 
-    # DDP no_sync context: skip gradient all-reduce on non-final microbatches.
-    # This avoids (grad_accum - 1) unnecessary NCCL syncs per step.
     def no_sync_ctx():
         if is_distributed and isinstance(model, DDP):
             return model.no_sync()
@@ -1118,6 +1133,14 @@ def main():
 
     try:
         for step in range(start_step, args.train_steps + 1):
+            # Check for graceful shutdown signal.
+            if _shutdown.is_set():
+                if is_main:
+                    print(f"Shutdown signal received at step {step}. Saving checkpoint...")
+                    save_checkpoint(ckpt_path, step)
+                    print(f"checkpoint -> {ckpt_path} (shutdown)")
+                break
+
             now = time.perf_counter()
             elapsed = now - start_time
             steps_done = max(step - start_step, 1)
@@ -1125,32 +1148,27 @@ def main():
             eta = max(args.train_steps - step, 0) * avg_step
 
             # Rolling cache: check if we need to rotate to next chunk.
-            # should_rotate() uses all-reduce so all ranks agree.
             if is_rolling and step > chunk_step_start and train_batcher.should_rotate():
                 if is_main:
                     print(f"cache: rotating to next chunk at step {step}")
                     save_checkpoint(ckpt_path, step)
                     print(f"checkpoint -> {ckpt_path} (pre-rotation)")
-                # ALL ranks must wait here while rank 0 saves checkpoint.
                 if dist.is_initialized():
                     dist.barrier()
-                # Increase NCCL timeout temporarily so the download doesn't
-                # trigger a watchdog kill on waiting ranks.
                 old_timeout = None
                 if dist.is_initialized():
-                    pg = dist.distributed_c10d._get_default_group()
-                    old_timeout = pg.options._timeout
-                    pg.options._timeout = timedelta(minutes=30)
+                    nccl_pg = dist.distributed_c10d._get_default_group()
+                    old_timeout = nccl_pg.options._timeout
+                    nccl_pg.options._timeout = timedelta(minutes=30)
                 train_batcher.load_next_chunk()
                 chunk_step_start = step
                 if dist.is_initialized():
                     dist.barrier()
                     if old_timeout is not None:
-                        pg.options._timeout = old_timeout
+                        nccl_pg.options._timeout = old_timeout
 
             if step == start_step or step % args.eval_every == 0:
-                # Sync CUDA before timing eval.
-                if str(device).startswith("cuda"):
+                if is_cuda:
                     torch.cuda.synchronize()
                 eval_start = time.perf_counter()
                 v = eval_loss(args.eval_iters)
@@ -1163,7 +1181,6 @@ def main():
                         f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
                         f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                     )
-                # Reset train loss tracker after eval.
                 train_loss_accum = 0.0
                 train_loss_count = 0
 
@@ -1176,30 +1193,29 @@ def main():
             step_loss = 0.0
             for micro_idx in range(args.grad_accum):
                 xb, yb = train_batcher.next(device)
-                # Only sync gradients on the last microbatch.
                 ctx = no_sync_ctx() if micro_idx < args.grad_accum - 1 else nullcontext()
                 with ctx:
-                    with torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
+                    with torch.amp.autocast("cuda", enabled=is_cuda):
                         _, loss = model(xb, yb)
                         loss = loss / args.grad_accum
                     scaler.scale(loss).backward()
                 step_loss += loss.item()
 
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Only clip parameters that have gradients (skip None grads).
+            graded_params = [p for p in model.parameters() if p.grad is not None]
+            if graded_params:
+                torch.nn.utils.clip_grad_norm_(graded_params, 1.0)
             scaler.step(opt)
             scaler.update()
 
-            # Accurate step timing: sync CUDA before measuring.
-            if str(device).startswith("cuda"):
+            if is_cuda:
                 torch.cuda.synchronize()
             last_step_dt = time.perf_counter() - step_start
 
-            # Accumulate training loss for periodic logging.
             train_loss_accum += step_loss
             train_loss_count += 1
 
-            # Log training loss between eval steps.
             if args.log_every > 0 and step > 0 and step % args.log_every == 0 and step % args.eval_every != 0:
                 avg_train_loss = train_loss_accum / max(train_loss_count, 1)
                 toks_per_s = (tokens_per_step / last_step_dt) if last_step_dt > 0 else 0.0
@@ -1213,7 +1229,7 @@ def main():
                 save_checkpoint(ckpt_path, step)
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
-        if is_main:
+        if is_main and not _shutdown.is_set():
             save_checkpoint(ckpt_path, args.train_steps)
             print(f"saved -> {ckpt_path}")
     finally:
