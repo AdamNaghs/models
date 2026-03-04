@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -124,16 +125,21 @@ ASST_PREFIX = "### Assistant:\n"
 TURN_SUFFIX = "\n"  # appended after each turn before EOS
 
 
-def format_conversation(messages, eos_token="</s>"):
-    """Format a multi-turn conversation into a single string.
+def tokenizer_fingerprint(sp):
+    """Stable tokenizer fingerprint to catch tokenizer/checkpoint mismatches."""
+    sample = "\n".join(sp.id_to_piece(i) for i in range(min(sp.vocab_size(), 4096)))
+    raw = f"vocab={sp.vocab_size()}|bos={sp.bos_id()}|eos={sp.eos_id()}|pad={sp.pad_id()}|{sample}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-    Returns:
-        text: the full formatted string
-        assistant_spans: list of (start_char, end_char) for assistant content
-                         (used to build the loss mask after tokenization)
+
+def tokenize_conversation_with_mask(messages, sp, context, pad_id=3):
+    """Tokenize a conversation and build an exact token-level assistant mask.
+
+    This avoids fragile character-level alignment heuristics.
     """
-    text = ""
-    assistant_spans = []
+    ids = []
+    token_mask = []
+    eos_id = sp.eos_id()
 
     for msg in messages:
         role = msg.get("role", "")
@@ -142,61 +148,27 @@ def format_conversation(messages, eos_token="</s>"):
             continue
 
         if role == "user":
-            text += USER_PREFIX + content + TURN_SUFFIX
+            part = sp.encode(USER_PREFIX + content + TURN_SUFFIX, out_type=int)
+            ids.extend(part)
+            token_mask.extend([0] * len(part))
         elif role == "assistant":
-            prefix = ASST_PREFIX
-            start = len(text) + len(prefix)
-            text += prefix + content + TURN_SUFFIX + eos_token
-            end = len(text)
-            assistant_spans.append((start, end))
-        # skip system/other roles
+            prefix = sp.encode(ASST_PREFIX, out_type=int)
+            body = sp.encode(content + TURN_SUFFIX, out_type=int)
 
-    return text, assistant_spans
+            ids.extend(prefix)
+            token_mask.extend([0] * len(prefix))
 
+            ids.extend(body)
+            token_mask.extend([1] * len(body))
 
-def tokenize_with_mask(text, assistant_spans, sp, context, pad_id=3):
-    """Tokenize text and build a loss mask from character-level assistant spans.
+            if eos_id >= 0:
+                ids.append(eos_id)
+                token_mask.append(1)
 
-    The mask is 1 for tokens that overlap with assistant content and 0 elsewhere.
-    This means loss is only computed on what the assistant said.
-
-    Returns:
-        input_ids: tensor of shape (context,) -- the input sequence
-        target_ids: tensor of shape (context,) -- shifted by 1
-        loss_mask: tensor of shape (context,) -- 1 where loss should be computed
-    """
-    # SentencePiece encode with byte offsets to map tokens back to characters.
-    pieces = sp.encode(text, out_type=str)
-    ids = sp.encode(text, out_type=int)
-
-    if len(ids) < 2:
+    if len(ids) < 2 or sum(token_mask) == 0:
         return None, None, None
 
-    # Build character-to-token mapping via SentencePiece's EncodeAsPieces.
-    # We reconstruct character positions by tracking piece lengths.
-    # SentencePiece uses U+2581 (lower one eighth block) for leading spaces.
-    char_pos = 0
-    token_char_starts = []
-    for piece in pieces:
-        token_char_starts.append(char_pos)
-        # Decode the piece back to get its character length in the original text.
-        decoded = piece.replace("\u2581", " ")
-        if decoded.startswith(" ") and char_pos == 0:
-            # Leading space artifact -- skip it
-            decoded = decoded[1:]
-        char_pos += len(decoded)
-
-    # Build per-token mask: 1 if token overlaps any assistant span.
-    token_mask = [0] * len(ids)
-    for i, start_char in enumerate(token_char_starts):
-        # Approximate token end as start of next token (or end of text).
-        end_char = token_char_starts[i + 1] if i + 1 < len(token_char_starts) else len(text)
-        for span_start, span_end in assistant_spans:
-            if start_char < span_end and end_char > span_start:
-                token_mask[i] = 1
-                break
-
-    # Truncate to context + 1 (need one extra for targets).
+    # Truncate to context + 1 (need one extra for shifted targets).
     max_len = context + 1
     if len(ids) > max_len:
         ids = ids[:max_len]
@@ -209,8 +181,10 @@ def tokenize_with_mask(text, assistant_spans, sp, context, pad_id=3):
 
     input_ids = torch.tensor(ids[:-1], dtype=torch.long)
     target_ids = torch.tensor(ids[1:], dtype=torch.long)
-    # Shift mask by 1 to align with targets (we predict the next token).
     loss_mask = torch.tensor(token_mask[1:], dtype=torch.long)
+
+    if loss_mask.sum().item() == 0:
+        return None, None, None
 
     return input_ids, target_ids, loss_mask
 
@@ -226,17 +200,11 @@ class ChatDataset(Dataset):
         self.sp = sp
         self.context = context
         self.pad_id = pad_id
-        self.eos_token = sp.id_to_piece(sp.eos_id()) if sp.eos_id() >= 0 else "</s>"
-
         # Pre-process all conversations.
         self.samples = []
         skipped = 0
         for conv in conversations:
-            text, spans = format_conversation(conv, eos_token=self.eos_token)
-            if not spans:
-                skipped += 1
-                continue
-            result = tokenize_with_mask(text, spans, sp, context, pad_id)
+            result = tokenize_conversation_with_mask(conv, sp, context, pad_id)
             if result[0] is not None:
                 self.samples.append(result)
             else:
@@ -369,10 +337,17 @@ def main():
     # Load tokenizer.
     sp = spm.SentencePieceProcessor(model_file=args.tok)
     pad_id = sp.pad_id() if sp.pad_id() >= 0 else 3
+    current_tok_fp = tokenizer_fingerprint(sp)
 
     # Load pretrained checkpoint.
     print(f"Loading pretrained checkpoint: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    ckpt_tok_fp = ckpt.get("tokenizer_fingerprint")
+    if ckpt_tok_fp and ckpt_tok_fp != current_tok_fp:
+        raise ValueError(
+            "Tokenizer mismatch: finetune tokenizer does not match pretraining checkpoint tokenizer. "
+            "Use the exact tokenizer.model used during pretraining."
+        )
     cfg = ckpt["args"]
     context = cfg["context"]
 
@@ -471,6 +446,7 @@ def main():
                 "asst_prefix": ASST_PREFIX,
                 "turn_suffix": TURN_SUFFIX,
             },
+            "tokenizer_fingerprint": current_tok_fp,
         }
         if best_val is not None:
             data["best_val_loss"] = best_val

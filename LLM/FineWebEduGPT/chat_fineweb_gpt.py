@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import platform
 
 import sentencepiece as spm
@@ -86,8 +87,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=256, temp=0.7, top_p=0.9,
-                 stop_tokens=None):
-        """Generate tokens with top-p sampling and optional stop tokens."""
+                 stop_tokens=None, stop_sequences=None):
+        """Generate tokens with top-p sampling and optional stop tokens/sequences."""
         for _ in range(max_new_tokens):
             logits = self(idx[:, -self.context:])[:, -1, :] / max(temp, 1e-4)
             probs = F.softmax(logits, dim=-1)
@@ -100,9 +101,17 @@ class GPT(nn.Module):
             nxt = torch.multinomial(s_probs, 1)
             tok = torch.gather(s_idx, -1, nxt)
             idx = torch.cat([idx, tok], dim=1)
-            # Stop on EOS or stop tokens.
+
+            # Stop on EOS or explicit stop tokens.
             if stop_tokens and tok.item() in stop_tokens:
                 break
+
+            # Stop on full token sequences (e.g., delimiter markers).
+            if stop_sequences:
+                tail = idx[0].tolist()
+                for seq in stop_sequences:
+                    if seq and len(tail) >= len(seq) and tail[-len(seq):] == seq:
+                        return idx
         return idx
 
 
@@ -110,6 +119,12 @@ class GPT(nn.Module):
 USER_PREFIX = "### User:\n"
 ASST_PREFIX = "### Assistant:\n"
 TURN_SUFFIX = "\n"
+
+
+def tokenizer_fingerprint(sp):
+    sample = "\n".join(sp.id_to_piece(i) for i in range(min(sp.vocab_size(), 4096)))
+    raw = f"vocab={sp.vocab_size()}|bos={sp.bos_id()}|eos={sp.eos_id()}|pad={sp.pad_id()}|{sample}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def main():
@@ -127,8 +142,16 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sp = spm.SentencePieceProcessor(model_file=args.tok)
+    tok_fp = tokenizer_fingerprint(sp)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     cfg = ckpt["args"]
+
+    ckpt_tok_fp = ckpt.get("tokenizer_fingerprint")
+    if ckpt_tok_fp and ckpt_tok_fp != tok_fp:
+        raise ValueError(
+            "Tokenizer mismatch: tokenizer.model does not match checkpoint tokenizer. "
+            "Use the same tokenizer from training/finetuning."
+        )
 
     # Detect if this is a finetuned checkpoint.
     is_finetuned = "chat_format" in ckpt
@@ -152,11 +175,13 @@ def main():
         except Exception:
             pass
 
-    # EOS token for stopping generation.
+    # Stop on EOS token and full delimiter sequences.
     eos_id = sp.eos_id()
-    # Also stop on the "###" token sequence (start of next turn).
-    hash_ids = set(sp.encode("###", out_type=int))
-    stop_tokens = {eos_id} | hash_ids if eos_id >= 0 else hash_ids
+    stop_tokens = {eos_id} if eos_id >= 0 else set()
+    stop_sequences = [
+        sp.encode("### User:", out_type=int),
+        sp.encode("### Assistant:", out_type=int),
+    ]
 
     mode_str = "chat (finetuned)" if is_finetuned else "completion (pretrained)"
     print(f"FineWebEduGPT {mode_str} | ctx={cfg['context']} | device={device}")
@@ -214,6 +239,7 @@ def main():
                 idx, max_new_tokens=args.max_tokens,
                 temp=args.temp, top_p=args.top_p,
                 stop_tokens=stop_tokens,
+                stop_sequences=stop_sequences,
             )
 
             generated = out[0].tolist()[len(ids):]
@@ -244,6 +270,7 @@ def main():
                 ids, max_new_tokens=args.max_tokens,
                 temp=args.temp, top_p=args.top_p,
                 stop_tokens=stop_tokens,
+                stop_sequences=stop_sequences,
             )
             text = sp.decode(out[0].tolist())
             reply = text[len(prompt):].split("\n")[0].strip()
