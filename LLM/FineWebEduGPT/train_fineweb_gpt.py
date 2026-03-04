@@ -14,20 +14,21 @@ Supports three data loading modes:
 Multi-GPU training via PyTorch DDP (torchrun --nproc_per_node=N).
 
 Usage examples:
-  # Single GPU, 5080 preset, rolling cache
-  python train_fineweb_gpt.py -5080 --cache-gb 5
+  # Single GPU, 350M preset, rolling cache
+  python train_fineweb_gpt.py -350M --cache-gb 5
 
-  # Multi-GPU, streaming mode
-  torchrun --nproc_per_node=4 train_fineweb_gpt.py -HPC --stream
+  # Multi-GPU (8x H100), 1.3B preset, streaming mode
+  torchrun --nproc_per_node=8 train_fineweb_gpt.py -1.3B --stream
 
   # Resume from checkpoint
-  python train_fineweb_gpt.py -5080 --cache-gb 5 --resume fineweb_gpt.ckpt
+  python train_fineweb_gpt.py -350M --cache-gb 5 --resume fineweb_gpt.ckpt
 """
 
 from datetime import timedelta
 
 import argparse
 import glob
+import hashlib
 import itertools
 import json
 import math
@@ -61,27 +62,41 @@ from datasets import load_dataset
 # optimized for a specific GPU tier. Override individual params via CLI flags.
 
 PRESETS = {
-    "5080": {
-        "train_steps": 150000,
-        "batch_size": 2,
-        "context": 1024,
-        "n_layer": 20,
+    "125m": {
+        "train_steps": 200000,
+        "batch_size": 64,
+        "context": 2048,
+        "n_layer": 12,
+        "n_head": 12,
+        "n_embd": 768,
+        "grad_accum": 2,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 200000,
+    },
+    "350m": {
+        "train_steps": 250000,
+        "batch_size": 32,
+        "context": 2048,
+        "n_layer": 24,
         "n_head": 16,
         "n_embd": 1024,
-        "grad_accum": 32,
-        "vocab_size": 32000,
-        "eval_every": 500,
-        "eval_iters": 12,
-        "ckpt_every": 2000,
-        "seed_docs": 100000,
+        "grad_accum": 4,
+        "vocab_size": 50000,
+        "eval_every": 1000,
+        "eval_iters": 16,
+        "ckpt_every": 5000,
+        "seed_docs": 200000,
     },
-    "hpc": {
-        "train_steps": 200000,
+    "760m": {
+        "train_steps": 300000,
         "batch_size": 16,
         "context": 2048,
-        "n_layer": 32,
-        "n_head": 32,
-        "n_embd": 4096,
+        "n_layer": 24,
+        "n_head": 16,
+        "n_embd": 1536,
         "grad_accum": 8,
         "vocab_size": 50000,
         "eval_every": 1000,
@@ -89,47 +104,19 @@ PRESETS = {
         "ckpt_every": 5000,
         "seed_docs": 200000,
     },
-    "10b": {
-        "train_steps": 250000,
+    "1.3b": {
+        "train_steps": 350000,
         "batch_size": 8,
         "context": 2048,
-        "n_layer": 40,
-        "n_head": 40,
-        "n_embd": 3840,
+        "n_layer": 29,
+        "n_head": 16,
+        "n_embd": 1856,
         "grad_accum": 16,
         "vocab_size": 50000,
         "eval_every": 1000,
         "eval_iters": 16,
         "ckpt_every": 5000,
-        "seed_docs": 250000,
-    },
-    "a100": {
-        "train_steps": 250000,
-        "batch_size": 24,
-        "context": 2048,
-        "n_layer": 40,
-        "n_head": 40,
-        "n_embd": 3840,
-        "grad_accum": 6,
-        "vocab_size": 50000,
-        "eval_every": 1000,
-        "eval_iters": 16,
-        "ckpt_every": 5000,
-        "seed_docs": 250000,
-    },
-    "h100": {
-        "train_steps": 300000,
-        "batch_size": 32,
-        "context": 4096,
-        "n_layer": 48,
-        "n_head": 48,
-        "n_embd": 4608,
-        "grad_accum": 4,
-        "vocab_size": 50000,
-        "eval_every": 1000,
-        "eval_iters": 16,
-        "ckpt_every": 5000,
-        "seed_docs": 300000,
+        "seed_docs": 200000,
     },
 }
 
@@ -211,8 +198,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     # Hardware preset shortcuts.
-    p.add_argument("--preset", choices=["5080", "hpc", "10b", "a100", "h100"],
-                   help="Apply a hardware-optimized training preset")
+    p.add_argument("--preset", choices=["125m", "350m", "760m", "1.3b"],
+                   help="Apply a size-based training preset (8x H100 80GB)")
 
     # Data loading modes (mutually exclusive in practice):
     #   --stream: Pure network streaming, no local storage needed.
@@ -231,27 +218,24 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint file to resume training from")
 
-    # Shorthand flags for presets: -5080, -HPC, -10B, -A100, -H100
+    # Shorthand flags for presets: -125M, -350M, -760M, -1.3B
     g = p.add_mutually_exclusive_group()
-    g.add_argument("-5080", dest="preset_5080", action="store_true")
-    g.add_argument("-HPC", dest="preset_hpc", action="store_true")
-    g.add_argument("-10B", dest="preset_10b", action="store_true")
-    g.add_argument("-A100", dest="preset_a100", action="store_true")
-    g.add_argument("-H100", dest="preset_h100", action="store_true")
+    g.add_argument("-125M", dest="preset_125m", action="store_true")
+    g.add_argument("-350M", dest="preset_350m", action="store_true")
+    g.add_argument("-760M", dest="preset_760m", action="store_true")
+    g.add_argument("-1.3B", dest="preset_1_3b", action="store_true")
 
     args = p.parse_args()
 
     # Resolve shorthand preset flags.
-    if args.preset_5080:
-        args.preset = "5080"
-    elif args.preset_hpc:
-        args.preset = "hpc"
-    elif args.preset_10b:
-        args.preset = "10b"
-    elif args.preset_a100:
-        args.preset = "a100"
-    elif args.preset_h100:
-        args.preset = "h100"
+    if args.preset_125m:
+        args.preset = "125m"
+    elif args.preset_350m:
+        args.preset = "350m"
+    elif args.preset_760m:
+        args.preset = "760m"
+    elif args.preset_1_3b:
+        args.preset = "1.3b"
 
     # Apply preset values, but only for params the user didn't explicitly set.
     # We detect explicit flags by checking sys.argv against the known flag names.
@@ -305,6 +289,13 @@ def estimate_params(vocab, context, n_embd, n_layer):
         + context * n_embd
         + n_layer * (12 * n_embd * n_embd + 9 * n_embd)
     )
+
+
+def tokenizer_fingerprint(sp):
+    """Stable tokenizer fingerprint to prevent tokenizer/checkpoint drift."""
+    sample = "\n".join(sp.id_to_piece(i) for i in range(min(sp.vocab_size(), 4096)))
+    raw = f"vocab={sp.vocab_size()}|bos={sp.bos_id()}|eos={sp.eos_id()}|pad={sp.pad_id()}|{sample}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def ensure_tokenizer(args, is_main=True):
@@ -1132,6 +1123,7 @@ def main():
     # --- Tokenizer ---
     sp = ensure_tokenizer(args, is_main=is_main)
     vocab = sp.vocab_size()
+    current_tok_fp = tokenizer_fingerprint(sp)
 
     # --- Data loaders ---
     train_batcher = make_batcher(
@@ -1183,6 +1175,12 @@ def main():
         if is_main:
             print(f"Resuming from checkpoint: {args.resume}")
         _ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        ckpt_tok_fp = _ckpt.get("tokenizer_fingerprint")
+        if ckpt_tok_fp and ckpt_tok_fp != current_tok_fp:
+            raise RuntimeError(
+                "Tokenizer mismatch while resuming checkpoint. "
+                "Use the exact tokenizer.model from the original training run."
+            )
         model.load_state_dict(_ckpt["state_dict"])
         start_step = _ckpt.get("step", 0) + 1
         if is_main:
@@ -1321,6 +1319,7 @@ def main():
             "args": vars(args),
             "vocab": vocab,
             "step": step,
+            "tokenizer_fingerprint": current_tok_fp,
         }
         if is_rolling:
             ckpt_data["cache_next_shard_idx"] = train_batcher._state.get("next_shard_idx", 0)

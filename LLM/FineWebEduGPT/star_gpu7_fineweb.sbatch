@@ -37,12 +37,8 @@ echo "========== STAGE 1: PRETRAINING =========="
 echo "Start: $(date)"
 
 torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
+    --preset 350m \
     --cache-gb 500 \
-    --eval-every 200 \
-    --eval-iters 12 \
-    --batch-size 64 \
-    --context 1024 \
-    --grad-accum 4 \
     --num-workers 8 \
     --queue-size 25
 

@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Usage:
-#   ./launch_torchrun.sh h100 8
-#   ./launch_torchrun.sh a100 4
+#   ./launch_torchrun.sh 350m 8
+#   ./launch_torchrun.sh 125m 8
+#   ./launch_torchrun.sh 1.3b 8
 
-PRESET="${1:-h100}"
+PRESET="${1:-350m}"
 NPROC="${2:-8}"
 
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}

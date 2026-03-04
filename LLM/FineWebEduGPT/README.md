@@ -41,31 +41,31 @@ pip install -r requirements.txt
 
 ## Pretraining
 
-Default run (single GPU):
+Default run (single GPU, 350M preset):
 
 ```bash
-python train_fineweb_gpt.py
+python train_fineweb_gpt.py -350M
 ```
 
 Pick a crawl snapshot:
 
 ```bash
-python train_fineweb_gpt.py --config CC-MAIN-2025-26
+python train_fineweb_gpt.py -350M --config CC-MAIN-2025-26
 ```
 
-### Hardware Presets
+### Size-Based Presets (8x H100 80GB)
 
-| Flag | Target | Layers | Heads | Embed | Context |
-|------|--------|--------|-------|-------|---------|
-| `-5080` | RTX 5080 | 20 | 16 | 1024 | 1024 |
-| `-HPC` | Generic HPC | 32 | 32 | 4096 | 2048 |
-| `-10B` | 10B params | 40 | 40 | 3840 | 2048 |
-| `-A100` | A100 cluster | 40 | 40 | 3840 | 2048 |
-| `-H100` | H100 cluster | 48 | 48 | 4608 | 4096 |
+| Flag | Parameters | Layers | Heads | Embed | Context | Batch | Grad Accum |
+|------|-----------|--------|-------|-------|---------|-------|------------|
+| `-125M` | ~125M | 12 | 12 | 768 | 2048 | 64 | 2 |
+| `-350M` | ~356M | 24 | 16 | 1024 | 2048 | 32 | 4 |
+| `-760M` | ~760M | 24 | 16 | 1536 | 2048 | 16 | 8 |
+| `-1.3B` | ~1.3B | 29 | 16 | 1856 | 2048 | 8 | 16 |
 
 ```bash
-python train_fineweb_gpt.py -5080
-python train_fineweb_gpt.py -H100
+python train_fineweb_gpt.py -125M
+python train_fineweb_gpt.py -350M
+python train_fineweb_gpt.py -1.3B
 ```
 
 ### Data Loading Modes
@@ -76,27 +76,26 @@ python train_fineweb_gpt.py -H100
 
 ```bash
 # Full download (run once, then train)
-python train_fineweb_gpt.py --download
-python train_fineweb_gpt.py -5080
+python train_fineweb_gpt.py -350M
 
 # Streaming (no local storage needed)
-python train_fineweb_gpt.py -5080 --stream
+python train_fineweb_gpt.py -350M --stream
 
 # Rolling cache (5 GB at a time)
-python train_fineweb_gpt.py -5080 --cache-gb 5
+python train_fineweb_gpt.py -350M --cache-gb 5
 ```
 
 ### Multi-GPU (torchrun)
 
 ```bash
-./launch_torchrun.sh h100 8
-./launch_torchrun.sh a100 4
+./launch_torchrun.sh 350m 8
+./launch_torchrun.sh 1.3b 8
 ```
 
 ### Resume Training
 
 ```bash
-python train_fineweb_gpt.py -5080 --resume fineweb_gpt.ckpt
+python train_fineweb_gpt.py -350M --resume fineweb_gpt.ckpt
 ```
 
 ## Chat Finetuning
@@ -104,7 +103,7 @@ python train_fineweb_gpt.py -5080 --resume fineweb_gpt.ckpt
 After pretraining completes, run SFT on UltraChat:
 
 ```bash
-# Full finetuning (3 epochs, ~2-3 hours on a 5080 for the 350M model)
+# Full finetuning (3 epochs)
 python finetune_chat.py --ckpt fineweb_gpt.ckpt --tok tokenizer.model
 
 # Quick test run (5k samples, ~10 minutes)
