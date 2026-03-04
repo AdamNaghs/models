@@ -55,12 +55,15 @@ python train_fineweb_gpt.py -350M --config CC-MAIN-2025-26
 
 ### Size-Based Presets (8x H100 80GB)
 
-| Flag | Parameters | Layers | Heads | Embed | Context | Batch | Grad Accum |
-|------|-----------|--------|-------|-------|---------|-------|------------|
-| `-125M` | ~125M | 12 | 12 | 768 | 2048 | 64 | 2 |
-| `-350M` | ~356M | 24 | 16 | 1024 | 2048 | 32 | 4 |
-| `-760M` | ~760M | 24 | 16 | 1536 | 2048 | 16 | 8 |
-| `-1.3B` | ~1.3B | 29 | 16 | 1856 | 2048 | 8 | 16 |
+| Flag | Parameters | Layers | Heads | Embed | Context | Batch | Grad Accum | LR | Steps |
+|------|-----------|--------|-------|-------|---------|-------|------------|-----|-------|
+| `-125M` | ~125M | 12 | 12 | 768 | 2048 | 64 | 2 | 6e-4 | 20k |
+| `-350M` | ~356M | 24 | 16 | 1024 | 2048 | 32 | 4 | 3e-4 | 30k |
+| `-760M` | ~760M | 24 | 16 | 1536 | 2048 | 16 | 8 | 2.5e-4 | 40k |
+| `-1.3B` | ~1.3B | 29 | 16 | 1856 | 2048 | 8 | 16 | 2e-4 | 50k |
+
+Learning rates follow GPT-3/Chinchilla scaling (smaller LR for larger models).
+Warmup: 1000 steps (125M), 2000 (350M/760M), 3000 (1.3B).
 
 ```bash
 python train_fineweb_gpt.py -125M

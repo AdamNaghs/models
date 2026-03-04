@@ -63,13 +63,16 @@ from datasets import load_dataset
 
 PRESETS = {
     "125m": {
-        "train_steps": 200000,
+        "train_steps": 20000,
         "batch_size": 64,
         "context": 2048,
         "n_layer": 12,
         "n_head": 12,
         "n_embd": 768,
         "grad_accum": 2,
+        "lr": 6e-4,
+        "min_lr": 6e-5,
+        "warmup_steps": 1000,
         "vocab_size": 50000,
         "eval_every": 1000,
         "eval_iters": 16,
@@ -77,13 +80,16 @@ PRESETS = {
         "seed_docs": 200000,
     },
     "350m": {
-        "train_steps": 250000,
+        "train_steps": 30000,
         "batch_size": 32,
         "context": 2048,
         "n_layer": 24,
         "n_head": 16,
         "n_embd": 1024,
         "grad_accum": 4,
+        "lr": 3e-4,
+        "min_lr": 3e-5,
+        "warmup_steps": 2000,
         "vocab_size": 50000,
         "eval_every": 1000,
         "eval_iters": 16,
@@ -91,13 +97,16 @@ PRESETS = {
         "seed_docs": 200000,
     },
     "760m": {
-        "train_steps": 300000,
+        "train_steps": 40000,
         "batch_size": 16,
         "context": 2048,
         "n_layer": 24,
         "n_head": 16,
         "n_embd": 1536,
         "grad_accum": 8,
+        "lr": 2.5e-4,
+        "min_lr": 2.5e-5,
+        "warmup_steps": 2000,
         "vocab_size": 50000,
         "eval_every": 1000,
         "eval_iters": 16,
@@ -105,13 +114,16 @@ PRESETS = {
         "seed_docs": 200000,
     },
     "1.3b": {
-        "train_steps": 350000,
+        "train_steps": 50000,
         "batch_size": 8,
         "context": 2048,
         "n_layer": 29,
         "n_head": 16,
         "n_embd": 1856,
         "grad_accum": 16,
+        "lr": 2e-4,
+        "min_lr": 2e-5,
+        "warmup_steps": 3000,
         "vocab_size": 50000,
         "eval_every": 1000,
         "eval_iters": 16,
@@ -1070,12 +1082,28 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
     if ds is None:
         ds = load_dataset(HF_DATASET, args.config, split="train")
 
-    return LocalBatcher(
-        sp, ds, args.context, args.batch_size,
-        queue_size=qsize, num_workers=nw,
-        rank=rank, world_size=world_size,
-        seed=args.seed,
-    )
+    # Split into train (99%) and val (1%) to avoid data overlap.
+    n_val = max(100, len(ds) // 100)
+    if is_val:
+        val_ds = ds.select(range(len(ds) - n_val, len(ds)))
+        if is_main:
+            print(f"data(val): using {len(val_ds):,} held-out docs")
+        return LocalBatcher(
+            sp, val_ds, args.context, args.batch_size,
+            queue_size=qsize, num_workers=nw,
+            rank=rank, world_size=world_size,
+            seed=args.seed + 9999,
+        )
+    else:
+        train_ds = ds.select(range(len(ds) - n_val))
+        if is_main:
+            print(f"data(train): {len(train_ds):,} docs (reserved {n_val:,} for val)")
+        return LocalBatcher(
+            sp, train_ds, args.context, args.batch_size,
+            queue_size=qsize, num_workers=nw,
+            rank=rank, world_size=world_size,
+            seed=args.seed,
+        )
 
 
 # =============================================================================
