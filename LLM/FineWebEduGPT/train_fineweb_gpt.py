@@ -226,6 +226,11 @@ def parse_args():
     p.add_argument("--cache-dir", type=str, default=".data_cache",
                    help="Directory for rolling cache parquet files")
 
+    # Output directory.
+    p.add_argument("--out-dir", type=str, default=None,
+                   help="Output directory for checkpoints and tokenizer "
+                        "(default: runs/<preset> or runs/custom if no preset)")
+
     # Checkpoint resume.
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint file to resume training from")
@@ -280,6 +285,18 @@ def parse_args():
         for k, v in PRESETS[args.preset].items():
             if not (key_to_flags.get(k, set()) & explicit_flags):
                 setattr(args, k, v)
+
+    # Resolve output directory (after preset so we know the preset name).
+    if args.out_dir is None:
+        args.out_dir = os.path.join("runs", args.preset if args.preset else "custom")
+
+    # Default tokenizer path inside out_dir (unless user explicitly set it).
+    if "--tokenizer-model" not in explicit_flags:
+        args.tokenizer_model = os.path.join(args.out_dir, "tokenizer.model")
+
+    # Default cache dir inside out_dir (unless user explicitly set it).
+    if "--cache-dir" not in explicit_flags:
+        args.cache_dir = os.path.join(args.out_dir, ".data_cache")
 
     return args
 
@@ -1148,6 +1165,13 @@ def main():
 
     is_main = (rank == 0)
 
+    # --- Output directory ---
+    if is_main:
+        os.makedirs(args.out_dir, exist_ok=True)
+        print(f"out_dir: {args.out_dir}")
+    if is_distributed:
+        dist.barrier()
+
     # --- Tokenizer ---
     sp = ensure_tokenizer(args, is_main=is_main)
     vocab = sp.vocab_size()
@@ -1355,7 +1379,7 @@ def main():
         torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, path)
 
-    ckpt_path = "fineweb_gpt.ckpt"
+    ckpt_path = os.path.join(args.out_dir, "fineweb_gpt.ckpt")
     start_time = time.perf_counter()
     last_step_dt = 0.0
     chunk_step_start = start_step
