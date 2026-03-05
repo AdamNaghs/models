@@ -53,7 +53,7 @@ Pick a crawl snapshot:
 python train_fineweb_gpt.py -350M --config CC-MAIN-2025-26
 ```
 
-### Size-Based Presets (8x H100 80GB)
+### Size-Based Presets (multi-GPU tuned defaults)
 
 | Flag | Parameters | Layers | Heads | Embed | Context | Batch | Grad Accum | LR | Steps |
 |------|-----------|--------|-------|-------|---------|-------|------------|-----|-------|

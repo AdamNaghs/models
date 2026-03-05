@@ -211,7 +211,7 @@ def parse_args():
 
     # Hardware preset shortcuts.
     p.add_argument("--preset", choices=["125m", "350m", "760m", "1.3b"],
-                   help="Apply a size-based training preset (8x H100 80GB)")
+                   help="Apply a size-based training preset (tuned for multi-GPU runs; override any field via CLI flags)")
 
     # Data loading modes (mutually exclusive in practice):
     #   --stream: Pure network streaming, no local storage needed.
