@@ -50,14 +50,16 @@ Stage 1: Pretraining                    Stage 2: SFT Finetuning
 ### Typical Workflow
 
 ```bash
+OUT_DIR=runs/350m
+
 # 1) Pretrain (single GPU)
-python train_fineweb_gpt.py -350M
+python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR"
 
 # 2) Finetune
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --tok tokenizer.model
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt"
 
 # 3) Chat
-python chat_fineweb_gpt.py --ckpt fineweb_gpt_chat.ckpt
+python chat_fineweb_gpt.py --ckpt "$OUT_DIR/fineweb_gpt_chat.ckpt"
 ```
 
 ---
@@ -113,13 +115,15 @@ FineWebEduGPT/
 ├── train_fineweb_gpt.py       # Stage 1 pretraining
 ├── finetune_chat.py           # Stage 2 SFT
 ├── chat_fineweb_gpt.py        # Inference chat loop
+├── fineweb_gpt_common.py      # Shared model/chat/artifact helpers
+├── smoke_test.py              # Fast local sanity checks
 ├── launch_torchrun.sh         # Multi-GPU launcher by preset
 ├── star_gpu7_fineweb.sbatch   # Example SLURM pipeline script
 ├── README.md                  # Quick start
 ├── docs/
 │   └── DOCUMENTATION.md       # This document
 │
-│ # Runtime outputs:
+│ # Runtime outputs (under OUT_DIR, default: runs/<preset>/):
 ├── tokenizer.model
 ├── tokenizer.vocab
 ├── tokenizer_seed.txt
@@ -152,6 +156,7 @@ Install:
 
 ```bash
 pip install -r requirements.txt
+python smoke_test.py
 ```
 
 ---
@@ -165,20 +170,19 @@ Train with standard causal LM objective (next-token prediction).
 ### Common Commands
 
 ```bash
+OUT_DIR=runs/350m
+
 # Default run (single GPU, no shorthand preset)
-python train_fineweb_gpt.py
+python train_fineweb_gpt.py --out-dir runs/custom
 
 # Recommended 350M preset
-python train_fineweb_gpt.py -350M
+python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR"
 
 # Alternate preset and crawl config
-python train_fineweb_gpt.py -760M --config CC-MAIN-2025-26
+python train_fineweb_gpt.py -760M --config CC-MAIN-2025-26 --out-dir runs/760m
 
 # Resume
-python train_fineweb_gpt.py -350M --resume fineweb_gpt.ckpt
-
-# Download-only (stage dataset in cache then exit)
-python train_fineweb_gpt.py --download
+python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/fineweb_gpt.ckpt"
 ```
 
 ### Training Loop (high level)
@@ -280,11 +284,11 @@ SentencePiece BPE is used for pretraining, finetuning, and inference.
 
 ### Auto-build flow
 
-If `tokenizer.model` is missing:
+If `<out_dir>/tokenizer.model` is missing:
 1. Stream `--seed-docs` documents from current FineWeb config.
 2. Write text to `tokenizer_seed.txt`.
 3. Train SentencePiece with configured `--vocab-size`.
-4. Save `tokenizer.model` and `tokenizer.vocab`.
+4. Save `tokenizer.model` and `tokenizer.vocab` under `OUT_DIR`.
 
 ### Special token IDs
 
@@ -346,11 +350,11 @@ All checkpoint writes are: `tmp file -> os.replace(tmp, final)`.
 
 ```bash
 # Direct torchrun
-torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --preset 350m
+torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --preset 350m --out-dir runs/350m
 
 # Convenience wrapper
 ./launch_torchrun.sh 350m 8
-./launch_torchrun.sh 1.3b 8
+./launch_torchrun.sh 1.3b 8 /scratch/$USER/fineweb-1.3b
 ```
 
 ---
@@ -368,8 +372,11 @@ sbatch star_gpu7_fineweb.sbatch
 ### Current stage-1 invocation
 
 ```bash
+OUT_DIR=${OUT_DIR:-runs/350m}
+
 torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
   --preset 350m \
+  --out-dir "$OUT_DIR" \
   --cache-gb 500 \
   --num-workers 8 \
   --queue-size 25
@@ -378,7 +385,7 @@ torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
 ### Notes
 
 - Script installs requirements at runtime.
-- It verifies `fineweb_gpt.ckpt` exists before starting SFT.
+- It verifies `$OUT_DIR/fineweb_gpt.ckpt` exists before starting SFT.
 - Adjust `#SBATCH` directives for your cluster constraints.
 
 ---
@@ -392,10 +399,11 @@ Convert pretrained next-token model into instruction/chat model with assistant-o
 ### Usage
 
 ```bash
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --tok tokenizer.model
+OUT_DIR=runs/350m
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt"
 
 # quick run
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --max-samples 5000
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --max-samples 5000
 ```
 
 ### Loss masking
@@ -416,8 +424,9 @@ This prevents wasting capacity on predicting user text.
 ### Usage
 
 ```bash
-python chat_fineweb_gpt.py --ckpt fineweb_gpt_chat.ckpt
-python chat_fineweb_gpt.py --ckpt fineweb_gpt.ckpt --raw
+OUT_DIR=runs/350m
+python chat_fineweb_gpt.py --ckpt "$OUT_DIR/fineweb_gpt_chat.ckpt"
+python chat_fineweb_gpt.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --raw
 ```
 
 ### Sampling
@@ -462,7 +471,6 @@ Stops on:
 | `--stream` | false | Stream from HF |
 | `--cache-gb` | 0 | Rolling cache size |
 | `--cache-dir` | `.data_cache` | Rolling cache directory |
-| `--download` | false | Download data and exit |
 | `--resume` | none | Resume checkpoint path |
 
 ### Finetuning (`finetune_chat.py`)
@@ -470,8 +478,8 @@ Stops on:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--ckpt` | required | Pretrained checkpoint |
-| `--tok` | `tokenizer.model` | Tokenizer path |
-| `--output` | `fineweb_gpt_chat.ckpt` | Output checkpoint |
+| `--tok` | `<ckpt_dir>/tokenizer.model` | Tokenizer path |
+| `--output` | `<ckpt_dir>/fineweb_gpt_chat.ckpt` | Output checkpoint |
 | `--dataset` | `ultrachat` | Dataset source |
 | `--data-path` | none | Custom JSONL path |
 | `--max-samples` | none | Data cap for quick tests |

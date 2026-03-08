@@ -21,6 +21,9 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
+OUT_DIR="${OUT_DIR:-runs/350m}"
+mkdir -p "$OUT_DIR"
+
 # Activate your environment (edit if needed)
 source llmvenv/bin/activate
 
@@ -30,6 +33,8 @@ pip install -r requirements.txt
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 
+echo "Artifacts will be written to: $OUT_DIR"
+
 # =============================================================================
 # Stage 1: Pretraining
 # =============================================================================
@@ -38,6 +43,7 @@ echo "Start: $(date)"
 
 torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
     --preset 350m \
+    --out-dir "$OUT_DIR" \
     --cache-gb 500 \
     --num-workers 8 \
     --queue-size 25
@@ -45,8 +51,8 @@ torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
 echo "Pretraining finished: $(date)"
 
 # Verify checkpoint exists before proceeding
-if [ ! -f fineweb_gpt.ckpt ]; then
-    echo "ERROR: fineweb_gpt.ckpt not found. Pretraining may have failed."
+if [ ! -f "$OUT_DIR/fineweb_gpt.ckpt" ]; then
+    echo "ERROR: $OUT_DIR/fineweb_gpt.ckpt not found. Pretraining may have failed."
     exit 1
 fi
 
@@ -57,8 +63,8 @@ echo "========== STAGE 2: CHAT FINETUNING =========="
 echo "Start: $(date)"
 
 python finetune_chat.py \
-    --ckpt fineweb_gpt.ckpt \
-    --tok tokenizer.model \
+    --ckpt "$OUT_DIR/fineweb_gpt.ckpt" \
+    --output "$OUT_DIR/fineweb_gpt_chat.ckpt" \
     --epochs 3 \
     --batch-size 4 \
     --grad-accum 8 \

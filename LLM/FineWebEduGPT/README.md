@@ -37,7 +37,10 @@ Interactive inference with multi-turn history, top-p sampling, and automatic sto
 
 ```bash
 pip install -r requirements.txt
+python smoke_test.py
 ```
+
+By default, pretraining writes artifacts to `runs/<preset>/`. Finetuning and chat can auto-discover `tokenizer.model` from the checkpoint directory.
 
 ## Pretraining
 
@@ -92,13 +95,14 @@ python train_fineweb_gpt.py -350M --cache-gb 5
 
 ```bash
 ./launch_torchrun.sh 350m 8
-./launch_torchrun.sh 1.3b 8
+./launch_torchrun.sh 1.3b 8 /scratch/$USER/fineweb-1.3b
 ```
 
 ### Resume Training
 
 ```bash
-python train_fineweb_gpt.py -350M --resume fineweb_gpt.ckpt
+OUT_DIR=runs/350m
+python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/fineweb_gpt.ckpt"
 ```
 
 ## Chat Finetuning
@@ -106,14 +110,16 @@ python train_fineweb_gpt.py -350M --resume fineweb_gpt.ckpt
 After pretraining completes, run SFT on UltraChat:
 
 ```bash
+OUT_DIR=runs/350m
+
 # Full finetuning (3 epochs)
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --tok tokenizer.model
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt"
 
 # Quick test run (5k samples, ~10 minutes)
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --max-samples 5000
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --max-samples 5000
 
 # Custom hyperparameters
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --epochs 3 --lr 2e-5 --batch-size 4 --grad-accum 8
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --epochs 3 --lr 2e-5 --batch-size 4 --grad-accum 8
 ```
 
 ### Custom Dataset
@@ -121,7 +127,8 @@ python finetune_chat.py --ckpt fineweb_gpt.ckpt --epochs 3 --lr 2e-5 --batch-siz
 You can also finetune on your own data in JSONL format:
 
 ```bash
-python finetune_chat.py --ckpt fineweb_gpt.ckpt --dataset custom --data-path my_chats.jsonl
+OUT_DIR=runs/350m
+python finetune_chat.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --dataset custom --data-path my_chats.jsonl
 ```
 
 Each line should be:
@@ -154,11 +161,13 @@ This prevents the model from wasting capacity trying to predict user inputs and 
 ## Chat
 
 ```bash
+OUT_DIR=runs/350m
+
 # With finetuned checkpoint (recommended)
-python chat_fineweb_gpt.py --ckpt fineweb_gpt_chat.ckpt --tok tokenizer.model
+python chat_fineweb_gpt.py --ckpt "$OUT_DIR/fineweb_gpt_chat.ckpt"
 
 # With pretrained checkpoint (raw completion, no chat structure)
-python chat_fineweb_gpt.py --ckpt fineweb_gpt.ckpt --raw
+python chat_fineweb_gpt.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --raw
 ```
 
 In-chat commands:
@@ -177,6 +186,8 @@ Options:
 
 ## Artifacts
 
+These live under your chosen `OUT_DIR` (default: `runs/<preset>/`).
+
 | File | Description |
 |------|-------------|
 | `tokenizer.model` | SentencePiece BPE tokenizer (auto-built from seed data if missing) |
@@ -187,6 +198,7 @@ Options:
 ## Notes
 
 - Windows skips `torch.compile` to avoid Triton issues.
-- The tokenizer is built automatically from the first N streamed documents if `tokenizer.model` doesn't exist.
+- The tokenizer is built automatically from the first N streamed documents if `<out_dir>/tokenizer.model` doesn't exist.
 - Full-streaming mode avoids downloading the entire FineWeb-Edu corpus to disk.
 - The chat format uses regular subword tokens (`### User:`, `### Assistant:`) rather than special tokens, so no vocabulary expansion is needed after pretraining.
+- `chat_fineweb_gpt.py` and `finetune_chat.py` auto-resolve `tokenizer.model` from the checkpoint directory unless you override `--tok`.

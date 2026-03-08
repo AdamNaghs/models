@@ -6,13 +6,12 @@ masked loss (only assistant tokens contribute to the loss), and saves
 a chat-ready checkpoint.
 
 Usage:
-    python finetune_chat.py --ckpt fineweb_gpt.ckpt --tok tokenizer.model
-    python finetune_chat.py --ckpt fineweb_gpt.ckpt --epochs 3 --lr 2e-5
-    python finetune_chat.py --ckpt fineweb_gpt.ckpt --dataset custom --data-path my_data.jsonl
+    python finetune_chat.py --ckpt runs/350m/fineweb_gpt.ckpt
+    python finetune_chat.py --ckpt runs/350m/fineweb_gpt.ckpt --epochs 3 --lr 2e-5
+    python finetune_chat.py --ckpt runs/350m/fineweb_gpt.ckpt --dataset custom --data-path my_data.jsonl
 """
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -22,115 +21,25 @@ import time
 
 import sentencepiece as spm
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-
-# ---------------------------------------------------------------------------
-# Model (duplicated from train_fineweb_gpt.py for portability)
-# ---------------------------------------------------------------------------
-
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head, dropout):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-        self.ff = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-        self._cpu_mask_cache: dict[int, torch.Tensor] = {}
-
-    def forward(self, x):
-        b, t, c = x.size()
-        x_norm = self.ln1(x)
-        qkv = self.qkv(x_norm)
-        q, k, v = qkv.split(c, dim=2)
-        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        if x.is_cuda:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            if t not in self._cpu_mask_cache:
-                self._cpu_mask_cache[t] = torch.triu(
-                    torch.ones(t, t, device=x.device), diagonal=1
-                ).bool()
-            m = self._cpu_mask_cache[t]
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=m,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=False,
-            )
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
-        x = x + self.resid_drop(self.proj(y))
-        return x + self.ff(self.ln2(x))
-
-
-class GPT(nn.Module):
-    def __init__(self, vocab, context, n_embd, n_head, n_layer, dropout):
-        super().__init__()
-        self.context = context
-        self.tok = nn.Embedding(vocab, n_embd)
-        self.pos = nn.Embedding(context, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout) for _ in range(n_layer)])
-        self.ln = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab, bias=False)
-        self.head.weight = self.tok.weight
-
-    def forward(self, idx, targets=None, loss_mask=None):
-        _, t = idx.shape
-        x = self.tok(idx) + self.pos(torch.arange(t, device=idx.device))
-        logits = self.head(self.ln(self.blocks(x)))
-        if targets is not None:
-            if loss_mask is not None:
-                # Masked cross-entropy: only compute loss on assistant tokens.
-                logits_flat = logits.view(-1, logits.size(-1))
-                targets_flat = targets.view(-1)
-                mask_flat = loss_mask.view(-1).float()
-                per_token_loss = F.cross_entropy(
-                    logits_flat, targets_flat, reduction="none"
-                )
-                loss = (per_token_loss * mask_flat).sum() / mask_flat.sum().clamp(min=1)
-            else:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)), targets.view(-1)
-                )
-            return logits, loss
-        return logits, None
+from fineweb_gpt_common import (
+    ASST_PREFIX,
+    GPT,
+    TURN_SUFFIX,
+    USER_PREFIX,
+    resolve_chat_output_path,
+    resolve_step_output_path,
+    resolve_tokenizer_path,
+    tokenizer_fingerprint,
+    unwrap_model,
+)
 
 
 # ---------------------------------------------------------------------------
 # Chat formatting
 # ---------------------------------------------------------------------------
-
-# These markers get tokenized as regular subword sequences -- no vocab changes
-# needed. The model learns to associate them with turn structure during SFT.
-USER_PREFIX = "### User:\n"
-ASST_PREFIX = "### Assistant:\n"
-TURN_SUFFIX = "\n"  # appended after each turn before EOS
-
-
-def tokenizer_fingerprint(sp):
-    """Stable tokenizer fingerprint to catch tokenizer/checkpoint mismatches."""
-    sample = "\n".join(sp.id_to_piece(i) for i in range(min(sp.vocab_size(), 4096)))
-    raw = f"vocab={sp.vocab_size()}|bos={sp.bos_id()}|eos={sp.eos_id()}|pad={sp.pad_id()}|{sample}"
-    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
-
 
 def tokenize_conversation_with_mask(messages, sp, context, pad_id=3):
     """Tokenize a conversation and build an exact token-level assistant mask.
@@ -281,6 +190,15 @@ def load_custom_jsonl(path, sp, context, val_split=0.05, pad_id=3):
     return train_ds, val_ds
 
 
+def masked_cross_entropy(logits, targets, loss_mask):
+    """Compute token loss only where loss_mask == 1."""
+    logits_flat = logits.view(-1, logits.size(-1))
+    targets_flat = targets.view(-1)
+    mask_flat = loss_mask.view(-1).float()
+    per_token_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none")
+    return (per_token_loss * mask_flat).sum() / mask_flat.sum().clamp(min=1)
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -288,8 +206,10 @@ def load_custom_jsonl(path, sp, context, val_split=0.05, pad_id=3):
 def parse_args():
     p = argparse.ArgumentParser(description="SFT finetuning for FineWebEduGPT")
     p.add_argument("--ckpt", required=True, help="Path to pretrained checkpoint")
-    p.add_argument("--tok", default="tokenizer.model", help="SentencePiece tokenizer model")
-    p.add_argument("--output", default="fineweb_gpt_chat.ckpt", help="Output checkpoint path")
+    p.add_argument("--tok", default=None,
+                   help="SentencePiece tokenizer model (defaults to <ckpt_dir>/tokenizer.model)")
+    p.add_argument("--output", default=None,
+                   help="Output checkpoint path (defaults to <ckpt_dir>/fineweb_gpt_chat.ckpt)")
 
     # Dataset
     p.add_argument("--dataset", default="ultrachat", choices=["ultrachat", "custom"],
@@ -318,7 +238,10 @@ def parse_args():
     p.add_argument("--ckpt-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
 
-    return p.parse_args()
+    args = p.parse_args()
+    args.tok = resolve_tokenizer_path(args.ckpt, args.tok)
+    args.output = resolve_chat_output_path(args.ckpt, args.output)
+    return args
 
 
 def main():
@@ -407,6 +330,8 @@ def main():
     print(f"  lr: {args.lr} -> {args.min_lr}")
     print(f"  dropout: {args.dropout}")
     print(f"  device: {device}")
+    print(f"  tokenizer: {args.tok}")
+    print(f"  output: {args.output}")
 
     def get_lr(step):
         if step < warmup_steps:
@@ -427,15 +352,16 @@ def main():
                 break
             inp, tgt, mask = inp.to(device), tgt.to(device), mask.to(device)
             with torch.amp.autocast("cuda", enabled=is_cuda):
-                _, loss = model(inp, tgt, loss_mask=mask)
-            if loss is not None:
-                losses.append(loss.item())
+                logits, _ = model(inp)
+                loss = masked_cross_entropy(logits, tgt, mask)
+            losses.append(loss.item())
         model.train()
         return sum(losses) / len(losses) if losses else float("nan")
 
     def save_ckpt(path, step, epoch, best_val=None):
+        raw_model = unwrap_model(model)
         data = {
-            "state_dict": model.state_dict(),
+            "state_dict": raw_model.state_dict(),
             "args": cfg,  # preserve original architecture config
             "vocab": ckpt["vocab"],
             "step": step,
@@ -479,7 +405,8 @@ def main():
             inp, tgt, mask = inp.to(device), tgt.to(device), mask.to(device)
 
             with torch.amp.autocast("cuda", enabled=is_cuda):
-                _, loss = model(inp, tgt, loss_mask=mask)
+                logits, _ = model(inp)
+                loss = masked_cross_entropy(logits, tgt, mask)
                 loss = loss / args.grad_accum
 
             scaler.scale(loss).backward()
@@ -525,7 +452,7 @@ def main():
 
                 # Periodic checkpoint.
                 if global_step % args.ckpt_every == 0:
-                    ckpt_name = f"fineweb_gpt_chat_step{global_step}.ckpt"
+                    ckpt_name = resolve_step_output_path(args.output, global_step)
                     save_ckpt(ckpt_name, global_step, epoch)
                     print(f"  -> checkpoint -> {ckpt_name}")
 

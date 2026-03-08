@@ -2,3 +2,5 @@ torch
 datasets
 sentencepiece
 numpy
+pyarrow
+huggingface_hub

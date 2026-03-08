@@ -15,20 +15,19 @@ Multi-GPU training via PyTorch DDP (torchrun --nproc_per_node=N).
 
 Usage examples:
   # Single GPU, 350M preset, rolling cache
-  python train_fineweb_gpt.py -350M --cache-gb 5
+  python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m
 
   # Multi-GPU (8x H100), 1.3B preset, streaming mode
-  torchrun --nproc_per_node=8 train_fineweb_gpt.py -1.3B --stream
+  torchrun --nproc_per_node=8 train_fineweb_gpt.py -1.3B --stream --out-dir runs/1.3b
 
   # Resume from checkpoint
-  python train_fineweb_gpt.py -350M --cache-gb 5 --resume fineweb_gpt.ckpt
+  python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m --resume runs/350m/fineweb_gpt.ckpt
 """
 
 from datetime import timedelta
 
 import argparse
 import glob
-import hashlib
 import itertools
 import json
 import math
@@ -49,10 +48,10 @@ import pyarrow.parquet as pq
 import sentencepiece as spm
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datasets import load_dataset
+
+from fineweb_gpt_common import GPT, tokenizer_fingerprint, unwrap_model
 
 
 # =============================================================================
@@ -320,13 +319,6 @@ def estimate_params(vocab, context, n_embd, n_layer):
     )
 
 
-def tokenizer_fingerprint(sp):
-    """Stable tokenizer fingerprint to prevent tokenizer/checkpoint drift."""
-    sample = "\n".join(sp.id_to_piece(i) for i in range(min(sp.vocab_size(), 4096)))
-    raw = f"vocab={sp.vocab_size()}|bos={sp.bos_id()}|eos={sp.eos_id()}|pad={sp.pad_id()}|{sample}"
-    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
-
-
 def ensure_tokenizer(args, is_main=True):
     """Load or build a SentencePiece BPE tokenizer.
 
@@ -379,132 +371,6 @@ def ensure_tokenizer(args, is_main=True):
         dist.barrier()
 
     return spm.SentencePieceProcessor(model_file=tok_model)
-
-
-# =============================================================================
-# Model Architecture
-# =============================================================================
-
-class Block(nn.Module):
-    """Single transformer block with pre-norm, multi-head self-attention, and FFN.
-
-    Architecture:
-      x -> LayerNorm -> QKV Attention -> Residual Add
-        -> LayerNorm -> FFN (4x expansion, GELU) -> Residual Add
-
-    Uses scaled_dot_product_attention with is_causal=True on CUDA for
-    Flash Attention kernel. Falls back to explicit causal mask on CPU.
-    """
-
-    def __init__(self, n_embd, n_head, dropout):
-        super().__init__()
-        assert n_embd % n_head == 0, f"n_embd ({n_embd}) must be divisible by n_head ({n_head})"
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-
-        # Pre-norm layers (applied before attention and FFN respectively).
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-        # Fused QKV projection: single matmul produces Q, K, V concatenated.
-        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=False)
-
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-
-        # Feed-forward network: expand 4x, GELU activation, project back.
-        self.ff = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-        # Cached causal mask for CPU fallback. Lazily created per sequence length.
-        self._cpu_mask_cache: dict[int, torch.Tensor] = {}
-
-    def forward(self, x):
-        b, t, c = x.size()
-
-        # Pre-norm + fused QKV projection.
-        x_norm = self.ln1(x)
-        qkv = self.qkv(x_norm)
-        q, k, v = qkv.split(c, dim=2)
-
-        # Reshape for multi-head attention: (B, T, C) -> (B, H, T, D)
-        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-
-        if x.is_cuda:
-            # CUDA path: uses Flash Attention via is_causal=True.
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            # CPU path: build explicit upper-triangular causal mask.
-            # Cached by sequence length to avoid recreating every forward pass.
-            if t not in self._cpu_mask_cache:
-                self._cpu_mask_cache[t] = torch.triu(
-                    torch.ones(t, t, device=x.device), diagonal=1
-                ).bool()
-            m = self._cpu_mask_cache[t]
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=m,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=False,
-            )
-
-        # Reshape back: (B, H, T, D) -> (B, T, C) and apply output projection.
-        y = y.transpose(1, 2).contiguous().view(b, t, c)
-
-        # Residual connections.
-        x = x + self.resid_drop(self.proj(y))
-        return x + self.ff(self.ln2(x))
-
-
-class GPT(nn.Module):
-    """GPT language model with weight-tied embeddings.
-
-    Architecture: Token Embedding + Positional Embedding -> N Blocks ->
-    LayerNorm -> Linear Head (weight-tied with token embedding).
-
-    Weight tying (Press & Wolf, 2017) shares the token embedding matrix
-    with the output projection, reducing parameters and improving training.
-    """
-
-    def __init__(self, vocab, context, n_embd, n_head, n_layer, dropout):
-        super().__init__()
-        self.context = context
-
-        # Learned token and positional embeddings.
-        self.tok = nn.Embedding(vocab, n_embd)
-        self.pos = nn.Embedding(context, n_embd)
-
-        # Stack of transformer blocks.
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout) for _ in range(n_layer)])
-
-        # Final layer norm before output projection.
-        self.ln = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab, bias=False)
-
-        # Weight tying: output head shares embedding weights.
-        self.head.weight = self.tok.weight
-
-    def forward(self, idx, targets=None):
-        """Forward pass. Returns (logits, loss) where loss is None if no targets."""
-        _, t = idx.shape
-        x = self.tok(idx) + self.pos(torch.arange(t, device=idx.device))
-        logits = self.head(self.ln(self.blocks(x)))
-        loss = (
-            F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            if targets is not None
-            else None
-        )
-        return logits, loss
 
 
 # =============================================================================
@@ -1332,9 +1198,7 @@ def main():
 
     # --- Training stats ---
     # Unwrap DDP and torch.compile to get the raw model for param counting.
-    raw_model = model.module if isinstance(model, DDP) else model
-    if hasattr(raw_model, "_orig_mod"):
-        raw_model = raw_model._orig_mod
+    raw_model = unwrap_model(model)
     params = sum(p.numel() for p in raw_model.parameters())
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     tokens_per_step = args.batch_size * args.context * args.grad_accum * world_size
