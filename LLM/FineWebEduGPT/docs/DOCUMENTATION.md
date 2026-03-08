@@ -22,6 +22,7 @@ A GPT language model trained from scratch on [FineWeb-Edu](https://huggingface.c
 14. [Hyperparameter Reference](#14-hyperparameter-reference)
 15. [Design Decisions](#15-design-decisions)
 16. [Troubleshooting](#16-troubleshooting)
+17. [Evaluation](#17-evaluation)
 
 ---
 
@@ -117,11 +118,24 @@ FineWebEduGPT/
 ├── chat_fineweb_gpt.py        # Inference chat loop
 ├── fineweb_gpt_common.py      # Shared model/chat/artifact helpers
 ├── smoke_test.py              # Fast local sanity checks
+├── run_eval.sh                # Quick eval wrapper
+├── eval/
+│   ├── model_adapter.py       # Checkpoint wrapper for scoring/generation/ppl
+│   ├── benchmark_loaders.py   # HF benchmark loaders -> normalized rows
+│   ├── eval_lm.py             # Held-out perplexity/avg NLL
+│   ├── eval_mcq.py            # Multiple-choice benchmark runner
+│   ├── eval_chat.py           # Prompt-suite chat regression runner
+│   ├── contamination_scan.py  # Exact + n-gram contamination scan
+│   ├── metrics.py             # Eval aggregates
+│   └── utils.py               # JSONL/text helpers
+├── eval_data/
+│   └── chat_eval_prompts.jsonl # Fixed chat regression prompt suite
 ├── launch_torchrun.sh         # Multi-GPU launcher by preset
 ├── star_gpu7_fineweb.sbatch   # Example SLURM pipeline script
 ├── README.md                  # Quick start
 ├── docs/
-│   └── DOCUMENTATION.md       # This document
+│   ├── DOCUMENTATION.md       # This document
+│   └── EVAL.md                # Eval workflow + contamination guidance
 │
 │ # Runtime outputs (under OUT_DIR, default: runs/<preset>/):
 ├── tokenizer.model
@@ -549,3 +563,89 @@ Use the exact `tokenizer.model` from the original pretraining run.
 ### DDP timeout during long I/O windows
 
 Large rolling-cache downloads can stall ranks. Increase timeout budget and verify node interconnect/network health.
+
+---
+
+## 17. Evaluation
+
+The repo includes a lightweight evaluation stack that works directly against the native checkpoint format. It is designed to answer four questions quickly:
+
+1. Did the base model actually learn language?
+2. How does it perform on small but meaningful reasoning benchmarks?
+3. Does the chat-tuned model behave coherently and follow instructions?
+4. Is benchmark performance inflated by contamination?
+
+### Evaluation entry points
+
+```bash
+OUT_DIR=runs/350m
+
+# Held-out LM sanity check
+python eval/eval_lm.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --dataset wikitext_valid
+
+# Multiple-choice benchmarks
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench hellaswag
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench piqa
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench winogrande
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench arc_challenge
+
+# Chat regression suite
+python eval/eval_chat.py --ckpt "$OUT_DIR/fineweb_gpt_chat.ckpt" --prompts eval_data/chat_eval_prompts.jsonl
+
+# Convenience wrapper (derives fineweb_gpt.ckpt from the same OUT_DIR)
+bash run_eval.sh "$OUT_DIR/fineweb_gpt_chat.ckpt"
+```
+
+### Included benchmark coverage
+
+- `eval_lm.py`: held-out perplexity / average negative log-likelihood on external text sets (`wikitext_valid`, `wikitext_test`, `lambada`)
+- `eval_mcq.py`: HellaSwag, PIQA, Winogrande, ARC-Easy, ARC-Challenge
+- `eval_chat.py`: fixed prompt suite covering factual QA, summarization, reasoning, safety, formatting, coding-lite prompts, and multi-turn memory
+- `contamination_scan.py`: exact-match + n-gram-overlap audit over local corpora and/or sampled FineWeb-Edu docs
+
+### Multiple-choice scoring method
+
+`eval_mcq.py` uses teacher-forced choice scoring:
+
+1. tokenize `prompt + choice`
+2. run the model once under teacher forcing
+3. sum log-probabilities only over the choice tokens
+4. select the choice with the highest score
+
+By default, selection uses **length-normalized log-probability** to reduce bias toward short answers. Use `--metric raw` if you want raw total log-probability instead.
+
+### Contamination scanning workflow
+
+```bash
+python eval/contamination_scan.py \
+  --bench hellaswag \
+  --bench piqa \
+  --fineweb-config CC-MAIN-2025-26 \
+  --fineweb-sample-docs 5000 \
+  --ckpt-label fineweb-scan
+```
+
+Outputs:
+
+- `benchmark_manifest.jsonl`
+- `contamination_findings.jsonl`
+- `contamination_summary.json`
+
+Status meanings:
+
+- `clean`: no strong overlap found in the scanned source set
+- `suspected`: exact prompt overlap or high n-gram overlap
+- `contaminated`: exact prompt + gold-answer overlap found
+
+### Recommended usage order
+
+1. `eval_lm.py`
+2. `eval_mcq.py`
+3. `eval_chat.py`
+4. `contamination_scan.py`
+
+That order matters. If the base model is weak, contamination analysis is mostly academic.
+
+### Additional reference
+
+See `docs/EVAL.md` for the full operator guide, example commands, and interpretation notes.

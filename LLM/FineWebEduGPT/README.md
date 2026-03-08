@@ -42,6 +42,8 @@ python smoke_test.py
 
 By default, pretraining writes artifacts to `runs/<preset>/`. Finetuning and chat can auto-discover `tokenizer.model` from the checkpoint directory.
 
+Evaluation docs live in [`docs/EVAL.md`](docs/EVAL.md).
+
 ## Pretraining
 
 Default run (single GPU, 350M preset):
@@ -183,6 +185,44 @@ Options:
 --top-p 0.9         # nucleus sampling threshold
 --max-history 5     # conversation turns to keep in context
 ```
+
+## Evaluation
+
+This repo now includes a lightweight eval stack under `eval/` plus a fixed chat regression set under `eval_data/`.
+
+Quick start:
+
+```bash
+OUT_DIR=runs/350m
+
+# LM sanity check
+python eval/eval_lm.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --dataset wikitext_valid
+
+# Core multiple-choice benchmarks
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench hellaswag
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench piqa
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench winogrande
+python eval/eval_mcq.py --ckpt "$OUT_DIR/fineweb_gpt.ckpt" --bench arc_challenge
+
+# Chat regression suite
+python eval/eval_chat.py --ckpt "$OUT_DIR/fineweb_gpt_chat.ckpt" --prompts eval_data/chat_eval_prompts.jsonl
+
+# Convenience wrapper (derives fineweb_gpt.ckpt from the same OUT_DIR)
+bash run_eval.sh "$OUT_DIR/fineweb_gpt_chat.ckpt"
+```
+
+Contamination scanning:
+
+```bash
+python eval/contamination_scan.py \
+  --bench hellaswag \
+  --bench piqa \
+  --fineweb-config CC-MAIN-2025-26 \
+  --fineweb-sample-docs 5000 \
+  --ckpt-label fineweb-scan
+```
+
+See [`docs/EVAL.md`](docs/EVAL.md) for the full workflow, interpretation notes, and contamination methodology.
 
 ## Artifacts
 
