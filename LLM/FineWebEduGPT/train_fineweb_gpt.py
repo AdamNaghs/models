@@ -538,8 +538,10 @@ class _SharedDocIterator:
     ensures only one thread advances the iterator at a time.
     """
 
-    def __init__(self, config, rank=0, world_size=1):
+    def __init__(self, config, rank=0, world_size=1, skip_docs=0):
         ds = load_dataset(HF_DATASET, config, split="train", streaming=True)
+        if skip_docs > 0:
+            ds = ds.skip(skip_docs)
         if world_size > 1:
             try:
                 from datasets.distributed import split_dataset_by_node
@@ -563,7 +565,7 @@ class StreamingBatcher:
     """
 
     def __init__(self, sp, config, context, batch_size, queue_size=64,
-                 num_workers=2, rank=0, world_size=1):
+                 num_workers=2, rank=0, world_size=1, skip_docs=0):
         self.sp = sp
         self.eos_id = sp.eos_id()
         self.context = context
@@ -571,7 +573,12 @@ class StreamingBatcher:
         self.q = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
         self.num_workers = max(1, num_workers)
-        self._shared_docs = _SharedDocIterator(config, rank=rank, world_size=world_size)
+        self._shared_docs = _SharedDocIterator(
+            config,
+            rank=rank,
+            world_size=world_size,
+            skip_docs=skip_docs,
+        )
 
         self.workers = []
         for _ in range(self.num_workers):
@@ -661,6 +668,41 @@ def _list_parquet_urls(config):
             "huggingface_hub is required for --cache-gb mode. "
             "Install with: pip install huggingface_hub"
         )
+
+
+def _stream_val_doc_count(args):
+    """Choose a deterministic streaming holdout large enough for eval reuse."""
+    return max(5000, args.eval_iters * args.batch_size * 8)
+
+
+def _load_stream_holdout_dataset(config, sample_docs):
+    """Materialize the first streamed documents as a held-out validation slice."""
+    from datasets import Dataset
+
+    ds = load_dataset(HF_DATASET, config, split="train", streaming=True)
+    docs = []
+    for ex in itertools.islice(ds, sample_docs):
+        text = (ex.get("text") or "").strip()
+        if text:
+            docs.append({"text": text})
+    if not docs:
+        raise RuntimeError(
+            f"Unable to reserve streaming validation documents for config '{config}'."
+        )
+    return Dataset.from_list(docs)
+
+
+def _make_stream_val_batcher(sp, args, *, rank=0, world_size=1, queue_size=16, num_workers=1, is_main=False):
+    holdout_docs = _stream_val_doc_count(args)
+    if is_main:
+        print(f"data(val): reserving first {holdout_docs:,} streamed docs as hold-out set")
+    val_ds = _load_stream_holdout_dataset(args.config, holdout_docs)
+    return LocalBatcher(
+        sp, val_ds, args.context, args.batch_size,
+        queue_size=queue_size, num_workers=num_workers,
+        rank=rank, world_size=world_size,
+        seed=args.seed + 9999,
+    )
 
 
 def _load_cache_state(state_path):
@@ -927,14 +969,24 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
       3. Default: Load full config into HF local cache (fastest).
     """
     if args.stream:
-        if is_main and not is_val:
-            print("data: streaming from HuggingFace Hub")
         qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
         nw = max(1, args.num_workers // 2) if is_val else args.num_workers
+        if is_val:
+            return _make_stream_val_batcher(
+                sp, args, rank=rank, world_size=world_size,
+                queue_size=qsize, num_workers=nw, is_main=is_main,
+            )
+        holdout_docs = _stream_val_doc_count(args)
+        if is_main:
+            print(
+                f"data: streaming from HuggingFace Hub "
+                f"(skipping first {holdout_docs:,} held-out docs)"
+            )
         return StreamingBatcher(
             sp, args.config, args.context, args.batch_size,
             queue_size=qsize, num_workers=nw,
             rank=rank, world_size=world_size,
+            skip_docs=holdout_docs,
         )
 
     if args.cache_gb > 0:
@@ -1066,14 +1118,15 @@ def main():
                 print(f"data(val): using {len(val_ds):,} held-out docs from cache chunk")
         else:
             # Fallback: stream validation data if no held-out set available.
-            val_batcher = StreamingBatcher(
-                sp, args.config, args.context, args.batch_size,
+            val_batcher = _make_stream_val_batcher(
+                sp, args,
                 queue_size=max(16, args.queue_size // 4),
                 num_workers=max(1, args.num_workers // 4),
                 rank=rank, world_size=world_size,
+                is_main=is_main,
             )
             if is_main:
-                print("data(val): fallback to streaming (no held-out set)")
+                print("data(val): fallback to streamed hold-out set (no held-out cache chunk)")
     else:
         val_batcher = make_batcher(
             sp, args, rank=rank, world_size=world_size,
@@ -1259,14 +1312,19 @@ def main():
         return nullcontext()
 
     # --- Main training loop ---
+    last_completed_step = start_step - 1
     try:
-        for step in range(start_step, args.train_steps + 1):
+        for step in range(start_step, args.train_steps):
             # Check for graceful shutdown (SIGTERM/SIGINT).
             if _shutdown.is_set():
                 if is_main:
-                    print(f"Shutdown signal received at step {step}. Saving checkpoint...")
-                    save_checkpoint(ckpt_path, step)
-                    print(f"checkpoint -> {ckpt_path} (shutdown)")
+                    print(f"Shutdown signal received before step {step}.")
+                    if last_completed_step >= 0:
+                        print("Saving last completed checkpoint...")
+                        save_checkpoint(ckpt_path, last_completed_step)
+                        print(f"checkpoint -> {ckpt_path} (shutdown)")
+                    else:
+                        print("No optimizer step completed yet; skipping shutdown checkpoint")
                 break
 
             now = time.perf_counter()
@@ -1280,8 +1338,9 @@ def main():
             if is_rolling and step > chunk_step_start and train_batcher.should_rotate():
                 if is_main:
                     print(f"cache: rotating to next chunk at step {step}")
-                    save_checkpoint(ckpt_path, step)
-                    print(f"checkpoint -> {ckpt_path} (pre-rotation)")
+                    if last_completed_step >= 0:
+                        save_checkpoint(ckpt_path, last_completed_step)
+                        print(f"checkpoint -> {ckpt_path} (pre-rotation)")
                 if dist.is_initialized():
                     dist.barrier()
                 # Increase NCCL timeout during download (may take minutes).
@@ -1344,6 +1403,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(graded_params, 1.0)
             scaler.step(opt)
             scaler.update()
+            last_completed_step = step
 
             if is_cuda:
                 torch.cuda.synchronize()
@@ -1369,8 +1429,8 @@ def main():
                 print(f"checkpoint -> {ckpt_path} | elapsed {(time.perf_counter()-start_time)/60:.1f}m")
 
         # Save final checkpoint at end of training.
-        if is_main and not _shutdown.is_set():
-            save_checkpoint(ckpt_path, args.train_steps)
+        if is_main and not _shutdown.is_set() and last_completed_step >= 0:
+            save_checkpoint(ckpt_path, last_completed_step)
             print(f"saved -> {ckpt_path}")
     finally:
         # Clean shutdown: close batchers and destroy process group.

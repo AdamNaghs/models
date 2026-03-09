@@ -303,11 +303,11 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=is_cuda, drop_last=True,
+        num_workers=0, pin_memory=is_cuda, drop_last=False,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=0, pin_memory=is_cuda, drop_last=True,
+        num_workers=0, pin_memory=is_cuda, drop_last=False,
     ) if len(val_ds) > 0 else None
 
     # Optimizer -- use lower LR than pretraining.
@@ -317,7 +317,7 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
 
-    steps_per_epoch = max(1, len(train_loader) // args.grad_accum)
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / args.grad_accum))
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -392,7 +392,9 @@ def main():
     model.train()
     global_step = 0
     best_val = float("inf")
+    best_saved = False
     start_time = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
 
     print(f"\nStarting SFT training...\n")
 
@@ -400,22 +402,27 @@ def main():
         epoch_loss = 0.0
         epoch_tokens = 0
         micro_step = 0
+        accum_inflight = 0
+        accum_target = None
 
         for batch_idx, (inp, tgt, mask) in enumerate(train_loader):
             inp, tgt, mask = inp.to(device), tgt.to(device), mask.to(device)
+            if accum_inflight == 0:
+                accum_target = min(args.grad_accum, len(train_loader) - batch_idx)
 
             with torch.amp.autocast("cuda", enabled=is_cuda):
                 logits, _ = model(inp)
-                loss = masked_cross_entropy(logits, tgt, mask)
-                loss = loss / args.grad_accum
+                raw_loss = masked_cross_entropy(logits, tgt, mask)
+                loss = raw_loss / accum_target
 
             scaler.scale(loss).backward()
             micro_step += 1
+            accum_inflight += 1
 
-            epoch_loss += loss.item() * args.grad_accum
+            epoch_loss += raw_loss.item()
             epoch_tokens += mask.sum().item()
 
-            if micro_step % args.grad_accum == 0:
+            if accum_inflight == accum_target:
                 scaler.unscale_(optimizer)
                 graded = [p for p in model.parameters() if p.grad is not None]
                 if graded:
@@ -429,6 +436,8 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                accum_inflight = 0
+                accum_target = None
 
                 # Logging.
                 if args.log_every > 0 and global_step % args.log_every == 0:
@@ -447,6 +456,7 @@ def main():
                     print(f"  -> val loss: {val:.4f} | ppl: {math.exp(val):.2f}")
                     if val < best_val:
                         best_val = val
+                        best_saved = True
                         save_ckpt(args.output, global_step, epoch, best_val)
                         print(f"  -> new best! saved -> {args.output}")
 
@@ -465,11 +475,14 @@ def main():
         )
         if val < best_val:
             best_val = val
+            best_saved = True
             save_ckpt(args.output, global_step, epoch, best_val)
             print(f"  -> new best! saved -> {args.output}")
 
-    # Final save.
-    save_ckpt(args.output, global_step, args.epochs - 1, best_val)
+    # Preserve args.output as the best checkpoint; only fall back to final
+    # weights if no validation pass ever produced a saved artifact.
+    if not best_saved:
+        save_ckpt(args.output, global_step, args.epochs - 1, best_val if math.isfinite(best_val) else None)
     elapsed = time.perf_counter() - start_time
     print(f"\nDone. Total time: {elapsed/60:.1f}m")
     print(f"Best val loss: {best_val:.4f}")
