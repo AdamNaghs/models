@@ -282,6 +282,20 @@ python train_fineweb_gpt.py -350M --cache-gb 5
 - Trains through it, rotates chunk, continues.
 - Good middle ground between storage and throughput.
 
+### D) Offline staged chunk mode
+
+```bash
+python train_fineweb_gpt.py -125M \
+  --offline \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --out-dir /fs1/proj/educational_web_data/runs/125m \
+  --stop-after-one-epoch
+```
+
+- Reads only local parquet files from the staged chunk directory.
+- Performs no HuggingFace network access when `--offline` is set.
+- Stops after one full pass over the staged chunk so operators can stage the next one manually.
+
 ### Train/Val split behavior
 
 For non-rolling local mode, the loader performs a held-out split:
@@ -299,8 +313,8 @@ SentencePiece BPE is used for pretraining, finetuning, and inference.
 ### Auto-build flow
 
 If `<out_dir>/tokenizer.model` is missing:
-1. Stream `--seed-docs` documents from current FineWeb config.
-2. Write text to `tokenizer_seed.txt`.
+1. If `--local-data-dir` is set, read `--seed-docs` documents from staged local parquet.
+2. Otherwise stream `--seed-docs` documents from current FineWeb config.
 3. Train SentencePiece with configured `--vocab-size`.
 4. Save `tokenizer.model` and `tokenizer.vocab` under `OUT_DIR`.
 
@@ -317,9 +331,63 @@ If `<out_dir>/tokenizer.model` is missing:
 
 Rank 0 builds tokenizer, then `dist.barrier()` gates other ranks before load.
 
+### Offline failure behavior
+
+If `--offline` is set:
+- missing staged parquet under `--local-data-dir` is a hard error
+- missing tokenizer falls back only to staged local parquet, never to HuggingFace
+- `--stream` and `--cache-gb` are rejected
+
 ---
 
-## 9. Checkpoints
+## 9. Star HPC Manual Chunk Workflow
+
+### Goal
+
+Use the login node for downloads, and the compute node only for training.
+
+### Step 1: Stage the next chunk on the login node
+
+```bash
+cd LLM/FineWebEduGPT
+python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-26 \
+  --max-gb 500
+```
+
+This script:
+- clears the previous staged chunk directory
+- downloads the next shard window into `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source`
+- writes `_chunk_manifest.json` in the source directory
+- updates `.download_state.json` under `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/`
+
+Run it again after each training job to stage the next 500 GB chunk.
+
+### Step 2: Submit training
+
+```bash
+sbatch --qos=long2x \
+  -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
+  star_gpu7_fineweb_125m.sbatch
+```
+
+The Star sbatch files:
+- use `--offline --local-data-dir "$LOCAL_DATA_DIR"`
+- resume from `<out_dir>/fineweb_gpt.ckpt` if it already exists
+- stop after one epoch over the staged chunk
+- do not launch chat finetuning automatically
+
+### Step 3: Repeat
+
+After the job finishes:
+1. run `download_fineweb_snapshot.py` again
+2. resubmit the same sbatch file
+3. keep the same `OUT_DIR` so pretraining resumes from the latest checkpoint
+
+---
+
+## 10. Checkpoints
 
 ### Pretraining checkpoint keys
 
@@ -347,7 +415,7 @@ All checkpoint writes are: `tmp file -> os.replace(tmp, final)`.
 
 ---
 
-## 10. Distributed Training
+## 11. Distributed Training
 
 ### Backend selection
 

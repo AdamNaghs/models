@@ -23,11 +23,10 @@ STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/760m}"
 CONFIG="${CONFIG:-CC-MAIN-2025-26}"
-CACHE_GB="${CACHE_GB:-500}"
 NPROC="${NPROC:-8}"
-CACHE_DIR="${CACHE_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/$PRESET}"
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/source}"
 
-mkdir -p "$LOG_DIR" "$OUT_DIR" "$CACHE_DIR"
+mkdir -p "$LOG_DIR" "$OUT_DIR" "$LOCAL_DATA_DIR"
 cd "$SLURM_SUBMIT_DIR"
 
 # Activate your environment (edit if needed)
@@ -43,19 +42,28 @@ echo "Config: $CONFIG"
 echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Artifacts will be written to: $OUT_DIR"
-echo "Dataset cache will be written to: $CACHE_DIR"
+echo "Local staged data dir: $LOCAL_DATA_DIR"
 
 echo "========== STAGE 1: PRETRAINING =========="
 echo "Start: $(date)"
 
-torchrun --standalone --nproc_per_node="$NPROC" train_fineweb_gpt.py \
-    --preset "$PRESET" \
-    --config "$CONFIG" \
-    --out-dir "$OUT_DIR" \
-    --cache-dir "$CACHE_DIR" \
-    --cache-gb "$CACHE_GB" \
-    --num-workers 8 \
+TRAIN_ARGS=(
+    --preset "$PRESET"
+    --config "$CONFIG"
+    --offline
+    --local-data-dir "$LOCAL_DATA_DIR"
+    --out-dir "$OUT_DIR"
+    --num-workers 8
     --queue-size 25
+    --stop-after-one-epoch
+)
+
+if [ -f "$OUT_DIR/fineweb_gpt.ckpt" ]; then
+    echo "Resuming pretraining from $OUT_DIR/fineweb_gpt.ckpt"
+    TRAIN_ARGS+=(--resume "$OUT_DIR/fineweb_gpt.ckpt")
+fi
+
+torchrun --standalone --nproc_per_node="$NPROC" train_fineweb_gpt.py "${TRAIN_ARGS[@]}"
 
 echo "Pretraining finished: $(date)"
 
@@ -64,18 +72,5 @@ if [ ! -f "$OUT_DIR/fineweb_gpt.ckpt" ]; then
     exit 1
 fi
 
-echo "========== STAGE 2: CHAT FINETUNING =========="
-echo "Start: $(date)"
-
-python finetune_chat.py \
-    --ckpt "$OUT_DIR/fineweb_gpt.ckpt" \
-    --output "$OUT_DIR/fineweb_gpt_chat.ckpt" \
-    --epochs 3 \
-    --batch-size 4 \
-    --grad-accum 8 \
-    --lr 2e-5 \
-    --eval-every 200 \
-    --log-every 10
-
-echo "Finetuning finished: $(date)"
-echo "========== ALL DONE =========="
+echo "Chunk training finished."
+echo "Run download_fineweb_snapshot.py again to stage the next chunk, then resubmit this sbatch."

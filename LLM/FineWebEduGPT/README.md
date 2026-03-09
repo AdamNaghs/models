@@ -81,6 +81,7 @@ python train_fineweb_gpt.py -1.3B
 - **Default**: downloads the full dataset to local cache, then trains from memory-mapped Arrow files. Fastest throughput.
 - **`--stream`**: reads directly from HuggingFace Hub. No disk usage, but slower and network-dependent.
 - **`--cache-gb N`**: rolling cache mode. Downloads N GB of data, trains on it, deletes it, downloads the next chunk. Good for limited disk space.
+- **`--offline --local-data-dir PATH`**: trains from a manually staged local parquet chunk. Intended for Star compute nodes with no outbound network access.
 
 ```bash
 # Full download (run once, then train)
@@ -91,6 +92,13 @@ python train_fineweb_gpt.py -350M --stream
 
 # Rolling cache (5 GB at a time)
 python train_fineweb_gpt.py -350M --cache-gb 5
+
+# Offline staged chunk (manual downloader workflow)
+python train_fineweb_gpt.py -125M \
+  --offline \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --out-dir /fs1/proj/educational_web_data/runs/125m \
+  --stop-after-one-epoch
 ```
 
 ### Multi-GPU (torchrun)
@@ -105,6 +113,52 @@ python train_fineweb_gpt.py -350M --cache-gb 5
 ```bash
 OUT_DIR=runs/350m
 python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/fineweb_gpt.ckpt"
+```
+
+### Star HPC Offline Workflow
+
+Star compute nodes should not download from HuggingFace directly. Use the login node to stage one chunk at a time:
+
+```bash
+cd LLM/FineWebEduGPT
+python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-26 \
+  --max-gb 500
+```
+
+This populates:
+
+```text
+/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+```
+
+and advances a downloader state file so the next run grabs the following chunk.
+
+Then submit pretraining:
+
+```bash
+sbatch --qos=long2x \
+  -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
+  star_gpu7_fineweb_125m.sbatch
+```
+
+The Star sbatch files now:
+- train only on the currently staged local chunk
+- save or resume from `<out_dir>/fineweb_gpt.ckpt`
+- stop after one full pass over that chunk
+- tell you to run `download_fineweb_snapshot.py` again before the next submit
+
+Tokenizer behavior in offline mode:
+- if `<out_dir>/tokenizer.model` already exists, it is reused
+- otherwise the tokenizer is built from the staged local parquet chunk
+
+Required paths for the `125m` preset:
+
+```text
+/fs1/proj/educational_web_data/runs/125m/tokenizer.model
+/fs1/proj/educational_web_data/runs/125m/fineweb_gpt.ckpt
+/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source/**/*.parquet
 ```
 
 ## Chat Finetuning
