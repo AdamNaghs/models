@@ -148,8 +148,8 @@ and advances a downloader state file for each config so later runs grab the foll
 Then submit pretraining:
 
 ```bash
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source,/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
-sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21,CC-MAIN-2025-26 \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch

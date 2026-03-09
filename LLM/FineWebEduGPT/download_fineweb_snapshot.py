@@ -232,8 +232,9 @@ def main() -> None:
 
     print("Next step:")
     print("  submit the Star sbatch job to train the staged config set")
-    staged_dirs = ",".join(result["output_dir"] for result in results)
+    staged_dirs = ":".join(result["output_dir"] for result in results)
     print(f"  LOCAL_DATA_DIRS={staged_dirs}")
+    print(f"  CONFIGS={':'.join(result['config'] for result in results)}")
 
 
 if __name__ == "__main__":

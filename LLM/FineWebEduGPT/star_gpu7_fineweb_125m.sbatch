@@ -26,10 +26,10 @@ CONFIGS="${CONFIGS:-CC-MAIN-2025-26}"
 NPROC="${NPROC:-8}"
 LOCAL_DATA_DIRS="${LOCAL_DATA_DIRS:-}"
 
-IFS=',' read -r -a CONFIG_LIST <<< "$CONFIGS"
+IFS=':' read -r -a CONFIG_LIST <<< "$CONFIGS"
 LOCAL_DIR_ARGS=()
 if [ -n "$LOCAL_DATA_DIRS" ]; then
-    IFS=',' read -r -a LOCAL_DIR_LIST <<< "$LOCAL_DATA_DIRS"
+    IFS=':' read -r -a LOCAL_DIR_LIST <<< "$LOCAL_DATA_DIRS"
 else
     LOCAL_DIR_LIST=()
     for cfg in "${CONFIG_LIST[@]}"; do
