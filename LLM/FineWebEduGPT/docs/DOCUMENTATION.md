@@ -299,6 +299,7 @@ python train_fineweb_gpt.py -125M \
 - Reads only local parquet files from the staged chunk directory.
 - Performs no HuggingFace network access when `--offline` is set.
 - Stops after one full pass over the staged chunk so operators can stage the next one manually.
+- Repeat `--local-data-dir` to combine several predownloaded configs into one offline training run.
 
 ### Train/Val split behavior
 
@@ -355,31 +356,33 @@ Use the login node for downloads, and the compute node only for training.
 ```bash
 cd LLM/FineWebEduGPT
 python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-21 \
   --config CC-MAIN-2025-26 \
   --max-gb 500
 ```
 
 This script:
-- clears the previous staged chunk directory
+- stages one `source/` directory per requested config
 - downloads the next shard window into `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source`
-- writes `_chunk_manifest.json` in the source directory
+- writes `_chunk_manifest.json` in each source directory
 - updates `.download_state.json` under `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/`
 
-Run it again after each training job to stage the next 500 GB chunk.
+Run it again after each training job to stage the next chunk for whichever configs still have remaining shards.
 
 ### Step 2: Submit training
 
 ```bash
-sbatch --qos=long2x \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source,/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21,CC-MAIN-2025-26 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch
 ```
 
 The Star sbatch files:
-- use `--offline --local-data-dir "$LOCAL_DATA_DIR"`
+- use `--offline` plus one `--local-data-dir` per staged config
 - resume from `<out_dir>/fineweb_gpt.ckpt` if it already exists
-- stop after one epoch over the staged chunk
+- stop after one epoch over the staged config set
 - do not launch chat finetuning automatically
 
 ### Step 3: Repeat

@@ -36,7 +36,7 @@ mkdir -p /fs1/proj/educational_web_data/logs
 
 Run the following loop until pretraining reaches its final step target.
 
-### Step 1: Stage the next chunk
+### Step 1: Stage the next config set
 
 Run this on the login node:
 
@@ -44,20 +44,23 @@ Run this on the login node:
 cd ~/edu_web_data/models/LLM/FineWebEduGPT
 source llmvenv/bin/activate
 python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-21 \
   --config CC-MAIN-2025-26 \
   --max-gb 500
 ```
 
 What it does:
-- clears the previous staged chunk under `.../source`
-- downloads the next shard window from FineWeb-Edu
-- writes `_chunk_manifest.json` in the source directory
-- advances `.download_state.json` so the next run downloads the following chunk
+- stages one `source/` directory per config
+- downloads the next shard window from each requested FineWeb-Edu config
+- writes `_chunk_manifest.json` in each source directory
+- advances `.download_state.json` so the next run downloads the following chunk for each config
 
 Optional checks:
 
 ```bash
+find /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source -name '*.parquet' | head
 find /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source -name '*.parquet' | head
+cat /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/.download_state.json
 cat /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/.download_state.json
 ```
 
@@ -67,16 +70,17 @@ For the `125m` preset:
 
 ```bash
 cd ~/edu_web_data/models/LLM/FineWebEduGPT
-sbatch --qos=long2x \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source,/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21,CC-MAIN-2025-26 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch
 ```
 
 What the sbatch does:
-- uses `--offline --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source`
+- uses `--offline` plus one `--local-data-dir` per staged config
 - resumes from `/fs1/proj/educational_web_data/runs/<preset>/fineweb_gpt.ckpt` if it exists
-- trains only on the currently staged chunk
+- trains on the currently staged config set
 - stops after one full pass over that chunk
 
 ### Step 3: Check job status
@@ -135,7 +139,7 @@ The job should stop by itself when either:
 - it reaches the preset’s total `train_steps`
 - it completes one full pass over the currently staged chunk
 
-When it finishes a chunk early, the output should include a message like:
+When it finishes the staged config set early, the output should include a message like:
 
 ```text
 data: completed one full pass over the staged local chunk
@@ -147,8 +151,9 @@ Chunk training finished. Run download_fineweb_snapshot.py again to stage the nex
 If pretraining is not finished yet:
 
 ```bash
-python download_fineweb_snapshot.py --config CC-MAIN-2025-26 --max-gb 500
-sbatch --qos=long2x \
+python download_fineweb_snapshot.py --config CC-MAIN-2025-21 --config CC-MAIN-2025-26 --max-gb 500
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source,/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21,CC-MAIN-2025-26 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch

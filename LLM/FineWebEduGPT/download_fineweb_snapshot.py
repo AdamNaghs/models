@@ -7,8 +7,9 @@ the next chunk of parquet shards into:
 
   /fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source
 
-The script keeps a state file outside the source directory so each invocation
-downloads the next chunk instead of starting over.
+The script keeps a state file outside each source directory so repeated
+invocations download the next chunk instead of starting over. Multiple configs
+can be staged in one command by repeating ``--config``.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download the next staged FineWeb shard chunk")
     p.add_argument(
         "--config",
-        default="CC-MAIN-2025-26",
+        action="append",
         choices=[
             "CC-MAIN-2025-05",
             "CC-MAIN-2025-08",
@@ -47,13 +48,18 @@ def parse_args() -> argparse.Namespace:
             "CC-MAIN-2025-21",
             "CC-MAIN-2025-26",
         ],
-        help="FineWeb-Edu config to stage",
+        help="FineWeb-Edu config to stage. Repeat to stage multiple configs.",
     )
     p.add_argument("--max-gb", type=float, default=500.0, help="Approximate chunk size to stage")
     p.add_argument("--output-dir", type=str, default=None, help="Where to place the staged parquet files")
     p.add_argument("--state-path", type=str, default=None, help="Download state file path")
     p.add_argument("--reset", action="store_true", default=False, help="Reset chunk progress to the beginning")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.config:
+        args.config = ["CC-MAIN-2025-26"]
+    if len(args.config) > 1 and (args.output_dir or args.state_path):
+        raise SystemExit("--output-dir and --state-path only support a single --config at a time.")
+    return args
 
 
 def list_parquet_shards(config: str) -> list[dict[str, Any]]:
@@ -112,23 +118,27 @@ def clear_directory(path: str) -> None:
             os.remove(full_path)
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = os.path.abspath(args.output_dir or default_output_dir(args.config))
-    state_path = os.path.abspath(args.state_path or default_state_path(args.config))
-    max_bytes = int(args.max_gb * 1e9)
-
-    shards = list_parquet_shards(args.config)
-    state = load_state(state_path, len(shards), reset=args.reset)
+def stage_config(config: str, *, max_gb: float, output_dir: str, state_path: str, reset: bool) -> dict[str, Any]:
+    max_bytes = int(max_gb * 1e9)
+    shards = list_parquet_shards(config)
+    state = load_state(state_path, len(shards), reset=reset)
     start_idx = int(state["next_shard_idx"])
 
     if start_idx >= len(shards):
-        print(f"All {len(shards)} shards for {args.config} have already been staged.")
+        print(f"All {len(shards)} shards for {config} have already been staged.")
         print("Use --reset if you want to restart from the beginning.")
-        return
+        return {
+            "config": config,
+            "output_dir": output_dir,
+            "state_path": state_path,
+            "completed": True,
+            "next_shard_idx": start_idx,
+            "total_shards": len(shards),
+            "total_bytes": 0,
+        }
 
     clear_directory(output_dir)
-    print(f"Staging shards for {args.config} into {output_dir}")
+    print(f"Staging shards for {config} into {output_dir}")
     print(f"Starting at shard index {start_idx} of {len(shards)}")
 
     downloaded = []
@@ -157,13 +167,13 @@ def main() -> None:
             break
 
     if not downloaded:
-        raise RuntimeError("No shards were downloaded. Check network access and output directory permissions.")
+        raise RuntimeError(f"No shards were downloaded for {config}. Check network access and output directory permissions.")
 
     next_idx = start_idx + len(downloaded)
     manifest = {
-        "config": args.config,
+        "config": config,
         "output_dir": output_dir,
-        "max_gb": args.max_gb,
+        "max_gb": max_gb,
         "current_shard_idx": start_idx,
         "next_shard_idx": next_idx,
         "total_shards": len(shards),
@@ -185,14 +195,45 @@ def main() -> None:
     save_json(state_path, state)
 
     print()
-    print(f"Chunk ready: shard range [{start_idx}, {next_idx})")
-    print(f"State file: {state_path}")
-    print("Next step:")
-    print("  submit the Star sbatch job to train this staged chunk")
+    print(f"{config}: chunk ready: shard range [{start_idx}, {next_idx})")
+    print(f"{config}: state file: {state_path}")
     if next_idx < len(shards):
-        print("After training finishes, run this downloader again to stage the next chunk.")
+        print(f"{config}: run the downloader again later to stage the next chunk.")
     else:
-        print("This was the final chunk for the selected config.")
+        print(f"{config}: this was the final chunk for the selected config.")
+    print()
+
+    return {
+        "config": config,
+        "output_dir": output_dir,
+        "state_path": state_path,
+        "completed": next_idx >= len(shards),
+        "next_shard_idx": next_idx,
+        "total_shards": len(shards),
+        "total_bytes": total_bytes,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    results = []
+
+    for config in args.config:
+        output_dir = os.path.abspath(args.output_dir or default_output_dir(config))
+        state_path = os.path.abspath(args.state_path or default_state_path(config))
+        result = stage_config(
+            config,
+            max_gb=args.max_gb,
+            output_dir=output_dir,
+            state_path=state_path,
+            reset=args.reset,
+        )
+        results.append(result)
+
+    print("Next step:")
+    print("  submit the Star sbatch job to train the staged config set")
+    staged_dirs = ",".join(result["output_dir"] for result in results)
+    print(f"  LOCAL_DATA_DIRS={staged_dirs}")
 
 
 if __name__ == "__main__":

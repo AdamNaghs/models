@@ -83,6 +83,7 @@ python train_fineweb_gpt.py -1.3B
 - **`--stream`**: reads directly from HuggingFace Hub. No disk usage, but slower and network-dependent.
 - **`--cache-gb N`**: rolling cache mode. Downloads N GB of data, trains on it, deletes it, downloads the next chunk. Good for limited disk space.
 - **`--offline --local-data-dir PATH`**: trains from a manually staged local parquet chunk. Intended for Star compute nodes with no outbound network access.
+- Repeat `--local-data-dir` to combine multiple predownloaded configs in one offline run.
 
 ```bash
 # Full download (run once, then train)
@@ -100,6 +101,13 @@ python train_fineweb_gpt.py -125M \
   --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
   --out-dir /fs1/proj/educational_web_data/runs/125m \
   --stop-after-one-epoch
+
+# Offline across multiple predownloaded configs
+python train_fineweb_gpt.py -125M \
+  --offline \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --out-dir /fs1/proj/educational_web_data/runs/125m
 ```
 
 ### Multi-GPU (torchrun)
@@ -118,36 +126,39 @@ python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/finewe
 
 ### Star HPC Offline Workflow
 
-Star compute nodes should not download from HuggingFace directly. Use the login node to stage one chunk at a time:
+Star compute nodes should not download from HuggingFace directly. Use the login node to stage one or more configs:
 
 ```bash
 cd LLM/FineWebEduGPT
 python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-21 \
   --config CC-MAIN-2025-26 \
   --max-gb 500
 ```
 
-This populates:
+This populates one staged `source/` directory per config, for example:
 
 ```text
+/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source
 /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
 ```
 
-and advances a downloader state file so the next run grabs the following chunk.
+and advances a downloader state file for each config so later runs grab the following chunk when needed.
 
 Then submit pretraining:
 
 ```bash
-sbatch --qos=long2x \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source,/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21,CC-MAIN-2025-26 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch
 ```
 
 The Star sbatch files now:
-- train only on the currently staged local chunk
+- train on the staged local config set you provided
 - save or resume from `<out_dir>/fineweb_gpt.ckpt`
-- stop after one full pass over that chunk
+- stop after one full pass over that staged config set
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
 
 Tokenizer behavior in offline mode:

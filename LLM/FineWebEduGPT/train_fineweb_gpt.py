@@ -28,6 +28,12 @@ Usage examples:
       --out-dir /fs1/proj/educational_web_data/runs/125m \
       --stop-after-one-epoch
 
+  # Offline across multiple predownloaded configs
+  torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+      --out-dir /fs1/proj/educational_web_data/runs/125m
+
   # Resume from checkpoint
   python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m --resume runs/350m/fineweb_gpt.ckpt
 """
@@ -255,8 +261,8 @@ def parse_args():
                    help="Directory for rolling cache parquet files")
     p.add_argument("--offline", action="store_true", default=False,
                    help="Disable HuggingFace network access and use only staged local parquet")
-    p.add_argument("--local-data-dir", type=str, default=None,
-                   help="Directory containing staged parquet files for offline/manual chunk training")
+    p.add_argument("--local-data-dir", action="append", default=None,
+                   help="Directory containing staged parquet files for offline/manual chunk training. Repeat to combine multiple configs.")
     p.add_argument("--stop-after-one-epoch", action="store_true", default=False,
                    help="Stop after one full pass over the current local dataset chunk")
 
@@ -334,7 +340,7 @@ def parse_args():
         args.cache_dir = default_cache_dir(args.config, args.preset)
 
     if args.local_data_dir is not None:
-        args.local_data_dir = os.path.abspath(args.local_data_dir)
+        args.local_data_dir = [os.path.abspath(path) for path in args.local_data_dir]
 
     return args
 
@@ -358,19 +364,40 @@ def estimate_params(vocab, context, n_embd, n_layer):
     )
 
 
+def format_local_data_dirs(local_data_dirs):
+    if not local_data_dirs:
+        return "(unset)"
+    if isinstance(local_data_dirs, str):
+        local_data_dirs = [local_data_dirs]
+    return ", ".join(os.path.abspath(path) for path in local_data_dirs)
+
+
 def discover_local_parquet_files(local_data_dir, *, required=False):
-    """Recursively discover staged parquet files under a local source tree."""
+    """Recursively discover staged parquet files under one or more source trees."""
     if not local_data_dir:
         if required:
             raise RuntimeError("Local parquet data is required but --local-data-dir was not provided.")
         return []
 
-    root = os.path.abspath(local_data_dir)
-    parquet_files = sorted(glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True))
+    roots = [local_data_dir] if isinstance(local_data_dir, str) else list(local_data_dir)
+    parquet_files = []
+    missing_roots = []
+    for root in roots:
+        abs_root = os.path.abspath(root)
+        if not os.path.exists(abs_root):
+            missing_roots.append(abs_root)
+            continue
+        parquet_files.extend(glob.glob(os.path.join(abs_root, "**", "*.parquet"), recursive=True))
+    parquet_files = sorted(set(parquet_files))
     if required and not parquet_files:
         raise RuntimeError(
-            f"No parquet files found under local data dir: {root}\n"
+            f"No parquet files found under local data dirs: {format_local_data_dirs(roots)}\n"
             "Run download_fineweb_snapshot.py first to stage the next chunk."
+        )
+    if required and missing_roots:
+        raise RuntimeError(
+            f"Missing local data dirs: {', '.join(missing_roots)}\n"
+            "Run download_fineweb_snapshot.py first to stage the requested configs."
         )
     return parquet_files
 
@@ -385,7 +412,10 @@ def load_local_parquet_dataset(local_data_dir, *, is_main=False, label="data", c
     """
     parquet_files = discover_local_parquet_files(local_data_dir, required=True)
     if is_main:
-        print(f"{label}: loading {len(parquet_files)} staged parquet files from {local_data_dir}...")
+        print(
+            f"{label}: loading {len(parquet_files)} staged parquet files from "
+            f"{format_local_data_dirs(local_data_dir)}..."
+        )
 
     ds = load_dataset(
         "parquet",
@@ -467,7 +497,7 @@ def ensure_tokenizer(args, is_main=True):
                 raise RuntimeError(
                     "Tokenizer missing and offline mode is enabled.\n"
                     f"Expected tokenizer at: {tok_model}\n"
-                    f"Expected staged parquet under: {args.local_data_dir or resolve_local_data_dir(args.config)}"
+                    f"Expected staged parquet under: {format_local_data_dirs(args.local_data_dir or [resolve_local_data_dir(args.config)])}"
                 )
             else:
                 print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
@@ -482,7 +512,7 @@ def ensure_tokenizer(args, is_main=True):
             if wrote_seed == 0:
                 raise RuntimeError(
                     "Unable to collect any tokenizer seed documents.\n"
-                    f"Checked local data dir: {args.local_data_dir or '(unset)'}"
+                    f"Checked local data dirs: {format_local_data_dirs(args.local_data_dir)}"
                 )
 
             spm.SentencePieceTrainer.train(
