@@ -43,6 +43,7 @@ python smoke_test.py
 By default, pretraining writes artifacts to `/fs1/proj/educational_web_data/runs/<preset>/`, and rolling-cache shards land under `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/<preset>/`. Override the root with `FINEWEB_STORAGE_ROOT` or pass explicit `--out-dir` / `--cache-dir`. Finetuning and chat can auto-discover `tokenizer.model` from the checkpoint directory.
 
 Evaluation docs live in [`docs/EVAL.md`](docs/EVAL.md).
+Star HPC usage docs live in [`docs/STAR_HPC.md`](docs/STAR_HPC.md).
 
 ## Pretraining
 

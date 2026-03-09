@@ -26,6 +26,10 @@ A GPT language model trained from scratch on [FineWeb-Edu](https://huggingface.c
 
 ---
 
+For the exact Star login-node and Slurm operator workflow, use [`STAR_HPC.md`](./STAR_HPC.md).
+
+---
+
 ## 1. Project Overview
 
 FineWebEduGPT is a two-stage training pipeline:
