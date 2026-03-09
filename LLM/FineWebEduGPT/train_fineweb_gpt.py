@@ -24,6 +24,8 @@ Usage examples:
   python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m --resume runs/350m/fineweb_gpt.ckpt
 """
 
+from __future__ import annotations
+
 from datetime import timedelta
 
 import argparse
