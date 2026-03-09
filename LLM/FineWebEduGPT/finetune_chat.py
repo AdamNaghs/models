@@ -317,7 +317,7 @@ def main():
     )
     scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
 
-    steps_per_epoch = max(1, len(train_loader) // args.grad_accum)
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / args.grad_accum))
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -393,29 +393,35 @@ def main():
     global_step = 0
     best_val = float("inf")
     start_time = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
 
     print(f"\nStarting SFT training...\n")
 
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         epoch_tokens = 0
-        micro_step = 0
+        accum_steps = 0
+        accum_target = None
 
         for batch_idx, (inp, tgt, mask) in enumerate(train_loader):
             inp, tgt, mask = inp.to(device), tgt.to(device), mask.to(device)
 
+            if accum_steps == 0:
+                batches_left = len(train_loader) - batch_idx
+                accum_target = min(args.grad_accum, batches_left)
+
             with torch.amp.autocast("cuda", enabled=is_cuda):
                 logits, _ = model(inp)
-                loss = masked_cross_entropy(logits, tgt, mask)
-                loss = loss / args.grad_accum
+                raw_loss = masked_cross_entropy(logits, tgt, mask)
+                loss = raw_loss / max(accum_target, 1)
 
             scaler.scale(loss).backward()
-            micro_step += 1
+            accum_steps += 1
 
-            epoch_loss += loss.item() * args.grad_accum
+            epoch_loss += raw_loss.item()
             epoch_tokens += mask.sum().item()
 
-            if micro_step % args.grad_accum == 0:
+            if accum_steps == accum_target:
                 scaler.unscale_(optimizer)
                 graded = [p for p in model.parameters() if p.grad is not None]
                 if graded:
@@ -429,6 +435,8 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                accum_steps = 0
+                accum_target = None
 
                 # Logging.
                 if args.log_every > 0 and global_step % args.log_every == 0:
@@ -469,7 +477,10 @@ def main():
             print(f"  -> new best! saved -> {args.output}")
 
     # Final save.
-    save_ckpt(args.output, global_step, args.epochs - 1, best_val)
+    if math.isfinite(best_val) and os.path.exists(args.output):
+        print(f"Preserved best checkpoint -> {args.output}")
+    else:
+        save_ckpt(args.output, global_step, args.epochs - 1, best_val)
     elapsed = time.perf_counter() - start_time
     print(f"\nDone. Total time: {elapsed/60:.1f}m")
     print(f"Best val loss: {best_val:.4f}")

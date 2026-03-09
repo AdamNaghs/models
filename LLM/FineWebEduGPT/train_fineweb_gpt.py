@@ -667,8 +667,12 @@ def _load_cache_state(state_path):
     """Load rolling cache progress state from disk."""
     if os.path.exists(state_path):
         with open(state_path) as f:
-            return json.load(f)
-    return {"next_shard_idx": 0, "total_shards_trained": 0}
+            state = json.load(f)
+        state.setdefault("current_shard_idx", 0)
+        state.setdefault("next_shard_idx", 0)
+        state.setdefault("total_shards_trained", 0)
+        return state
+    return {"current_shard_idx": 0, "next_shard_idx": 0, "total_shards_trained": 0}
 
 
 def _save_cache_state(state_path, state):
@@ -790,7 +794,11 @@ class RollingCacheBatcher:
                 self._all_shards = json.load(f)
 
         # Load or initialize progress state.
-        self._state = _load_cache_state(self.state_path) if is_main else {"next_shard_idx": 0}
+        self._state = (
+            _load_cache_state(self.state_path)
+            if is_main
+            else {"current_shard_idx": 0, "next_shard_idx": 0, "total_shards_trained": 0}
+        )
 
         # Broadcast state from rank 0 so all ranks start at the same shard.
         if self.is_distributed:
@@ -809,15 +817,35 @@ class RollingCacheBatcher:
 
         self._inner = None
         self._val_ds = None  # Held-out validation slice from first chunk.
-        self._load_next_chunk()
+        initial_idx = self._initial_chunk_start()
+        self._load_next_chunk(start_idx=initial_idx)
 
-    def _load_next_chunk(self):
-        """Download next batch of shards and create a new LocalBatcher."""
+    def _initial_chunk_start(self):
+        """Recover the currently active chunk start from persisted state."""
+        current_idx = int(self._state.get("current_shard_idx", 0))
+        next_idx = int(self._state.get("next_shard_idx", 0))
+        if current_idx or next_idx == 0:
+            return current_idx
+
+        count_path = os.path.join(self.cache_dir, "_chunk_count.json")
+        if os.path.exists(count_path):
+            with open(count_path) as f:
+                info = json.load(f)
+            inferred = max(0, int(info.get("next_idx", next_idx)) - int(info.get("n_shards", 0)))
+            self._state["current_shard_idx"] = inferred
+            self._state["next_shard_idx"] = int(info.get("next_idx", next_idx))
+            if self.is_main:
+                _save_cache_state(self.state_path, self._state)
+            return inferred
+        return current_idx
+
+    def _load_next_chunk(self, start_idx=None, expected_next_idx=None, count_as_trained=True):
+        """Download a shard chunk and create a new LocalBatcher."""
         if self._inner is not None:
             self._inner.close()
             self._inner = None
 
-        idx = self._state["next_shard_idx"]
+        idx = self._state["next_shard_idx"] if start_idx is None else int(start_idx)
         remaining = self._all_shards[idx:]
 
         # Wrap around if all shards consumed.
@@ -835,8 +863,12 @@ class RollingCacheBatcher:
             n_downloaded = len(downloaded)
             print(f"cache: downloaded {n_downloaded} shards into {self.cache_dir}")
 
-            self._state["next_shard_idx"] = idx + n_downloaded
-            self._state["total_shards_trained"] = self._state.get("total_shards_trained", 0) + n_downloaded
+            self._state["current_shard_idx"] = idx
+            self._state["next_shard_idx"] = (
+                int(expected_next_idx) if expected_next_idx is not None else idx + n_downloaded
+            )
+            if count_as_trained:
+                self._state["total_shards_trained"] = self._state.get("total_shards_trained", 0) + n_downloaded
             _save_cache_state(self.state_path, self._state)
 
             count_path = os.path.join(self.cache_dir, "_chunk_count.json")
@@ -868,6 +900,9 @@ class RollingCacheBatcher:
             if os.path.exists(count_path):
                 with open(count_path) as f:
                     info = json.load(f)
+                    self._state["current_shard_idx"] = max(
+                        0, int(info["next_idx"]) - int(info["n_shards"])
+                    )
                     self._state["next_shard_idx"] = info["next_idx"]
 
         # Reserve 1% (min 100 docs) as validation set from first chunk only.
@@ -905,6 +940,20 @@ class RollingCacheBatcher:
     def load_next_chunk(self):
         """Externally trigger chunk rotation."""
         self._load_next_chunk()
+
+    def restore_position(self, current_idx, next_idx):
+        """Reload the chunk described by a checkpointed rolling-cache position."""
+        self._state["current_shard_idx"] = int(current_idx)
+        self._state["next_shard_idx"] = int(next_idx)
+        if self.is_main:
+            _save_cache_state(self.state_path, self._state)
+        if self.is_distributed:
+            dist.barrier()
+        self._load_next_chunk(
+            start_idx=current_idx,
+            expected_next_idx=next_idx,
+            count_as_trained=False,
+        )
 
     def next(self, device):
         return self._inner.next(device)
@@ -1162,8 +1211,14 @@ def main():
             if is_main:
                 print("Restored scaler state")
         if is_rolling and "cache_next_shard_idx" in _ckpt:
+            cache_current = int(_ckpt.get("cache_current_shard_idx", train_batcher._state.get("current_shard_idx", 0)))
+            cache_next = int(_ckpt["cache_next_shard_idx"])
+            active_current = int(train_batcher._state.get("current_shard_idx", 0))
+            active_next = int(train_batcher._state.get("next_shard_idx", 0))
+            if (active_current, active_next) != (cache_current, cache_next):
+                train_batcher.restore_position(cache_current, cache_next)
             if is_main:
-                print(f"Restored cache shard index: {_ckpt['cache_next_shard_idx']}")
+                print(f"Restored cache shard range: [{cache_current}, {cache_next})")
         del _ckpt  # Free checkpoint memory.
 
     # --- Learning rate schedule ---
@@ -1238,6 +1293,7 @@ def main():
             "tokenizer_fingerprint": current_tok_fp,
         }
         if is_rolling:
+            ckpt_data["cache_current_shard_idx"] = train_batcher._state.get("current_shard_idx", 0)
             ckpt_data["cache_next_shard_idx"] = train_batcher._state.get("next_shard_idx", 0)
         tmp_path = path + ".tmp"
         torch.save(ckpt_data, tmp_path)
