@@ -375,17 +375,24 @@ def discover_local_parquet_files(local_data_dir, *, required=False):
     return parquet_files
 
 
-def load_local_parquet_dataset(local_data_dir, *, is_main=False, label="data"):
-    """Load a staged local parquet tree into an Arrow-backed HF Dataset."""
+def load_local_parquet_dataset(local_data_dir, *, is_main=False, label="data", cache_dir=None):
+    """Load a staged local parquet tree into an Arrow-backed HF Dataset.
+
+    This intentionally goes through the datasets parquet builder instead of
+    eagerly reading every parquet file into memory with pyarrow. That keeps
+    staged local training backed by on-disk Arrow files rather than multiplying
+    the full chunk in RAM on every DDP rank.
+    """
     parquet_files = discover_local_parquet_files(local_data_dir, required=True)
     if is_main:
         print(f"{label}: loading {len(parquet_files)} staged parquet files from {local_data_dir}...")
 
-    from datasets import Dataset
-
-    tables = [pq.read_table(path, columns=["text"]) for path in parquet_files]
-    combined = pa.concat_tables(tables)
-    ds = Dataset(combined)
+    ds = load_dataset(
+        "parquet",
+        data_files={"train": parquet_files},
+        split="train",
+        cache_dir=cache_dir,
+    )
 
     if is_main:
         print(f"{label}: {len(ds):,} documents loaded from staged local parquet")
@@ -1108,16 +1115,27 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
     if args.local_data_dir:
         qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
         nw = max(1, args.num_workers // 2) if is_val else args.num_workers
+        local_cache_dir = os.path.join(args.out_dir, ".local_dataset_cache")
 
         ds = None
         if is_main:
-            ds = load_local_parquet_dataset(args.local_data_dir, is_main=True, label="data")
+            ds = load_local_parquet_dataset(
+                args.local_data_dir,
+                is_main=True,
+                label="data",
+                cache_dir=local_cache_dir,
+            )
 
         if dist.is_initialized():
             dist.barrier()
 
         if ds is None:
-            ds = load_local_parquet_dataset(args.local_data_dir, is_main=False, label="data")
+            ds = load_local_parquet_dataset(
+                args.local_data_dir,
+                is_main=False,
+                label="data",
+                cache_dir=local_cache_dir,
+            )
 
         n_val = max(100, len(ds) // 100)
         if is_val:
