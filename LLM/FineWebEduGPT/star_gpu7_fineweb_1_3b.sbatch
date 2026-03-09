@@ -18,8 +18,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 PRESET="1.3b"
 STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
@@ -30,7 +28,7 @@ NPROC="${NPROC:-8}"
 CACHE_DIR="${CACHE_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/$PRESET}"
 
 mkdir -p "$LOG_DIR" "$OUT_DIR" "$CACHE_DIR"
-cd "$SCRIPT_DIR"
+cd "$SLURM_SUBMIT_DIR"
 
 # Activate your environment (edit if needed)
 source llmvenv/bin/activate
