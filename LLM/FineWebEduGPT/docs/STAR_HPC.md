@@ -71,7 +71,7 @@ For the `125m` preset:
 ```bash
 cd ~/edu_web_data/models/LLM/FineWebEduGPT
 LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
-sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26 \
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=8,GRAD_ACCUM=16 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch
@@ -82,6 +82,7 @@ What the sbatch does:
 - resumes from `/fs1/proj/educational_web_data/runs/<preset>/fineweb_gpt.ckpt` if it exists
 - trains on the currently staged config set
 - stops after one full pass over that chunk
+- uses H100-safe `125m` settings: `BATCH_SIZE=8`, `GRAD_ACCUM=16`, and `--no-compile`
 
 ### Step 3: Check job status
 
@@ -153,7 +154,7 @@ If pretraining is not finished yet:
 ```bash
 python download_fineweb_snapshot.py --config CC-MAIN-2025-21 --config CC-MAIN-2025-26 --max-gb 500
 LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
-sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26 \
+sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=8,GRAD_ACCUM=16 \
   -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
   star_gpu7_fineweb_125m.sbatch

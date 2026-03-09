@@ -63,7 +63,7 @@ python train_fineweb_gpt.py -350M --config CC-MAIN-2025-26
 
 | Flag | Parameters | Layers | Heads | Embed | Context | Batch | Grad Accum | LR | Steps |
 |------|-----------|--------|-------|-------|---------|-------|------------|-----|-------|
-| `-125M` | ~125M | 12 | 12 | 768 | 2048 | 64 | 2 | 6e-4 | 20k |
+| `-125M` | ~125M | 12 | 12 | 768 | 2048 | 8 | 16 | 6e-4 | 20k |
 | `-350M` | ~356M | 24 | 16 | 1024 | 2048 | 32 | 4 | 3e-4 | 30k |
 | `-760M` | ~760M | 24 | 16 | 1536 | 2048 | 16 | 8 | 2.5e-4 | 40k |
 | `-1.3B` | ~1.3B | 29 | 16 | 1856 | 2048 | 8 | 16 | 2e-4 | 50k |
@@ -160,6 +160,7 @@ The Star sbatch files now:
 - save or resume from `<out_dir>/fineweb_gpt.ckpt`
 - stop after one full pass over that staged config set
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
+- use H100-safe `125m` defaults of `--batch-size 8 --grad-accum 16 --no-compile`
 
 Tokenizer behavior in offline mode:
 - if `<out_dir>/tokenizer.model` already exists, it is reused

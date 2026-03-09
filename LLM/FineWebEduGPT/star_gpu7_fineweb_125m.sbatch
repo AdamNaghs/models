@@ -24,6 +24,8 @@ LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/125m}"
 CONFIGS="${CONFIGS:-CC-MAIN-2025-26}"
 NPROC="${NPROC:-8}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
 LOCAL_DATA_DIRS="${LOCAL_DATA_DIRS:-}"
 
 IFS=':' read -r -a CONFIG_LIST <<< "$CONFIGS"
@@ -58,6 +60,8 @@ echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Artifacts will be written to: $OUT_DIR"
 echo "Local staged data dirs: ${LOCAL_DIR_LIST[*]}"
+echo "Micro-batch size per GPU: $BATCH_SIZE"
+echo "Gradient accumulation steps: $GRAD_ACCUM"
 
 echo "========== STAGE 1: PRETRAINING =========="
 echo "Start: $(date)"
@@ -67,9 +71,12 @@ TRAIN_ARGS=(
     --config "${CONFIG_LIST[0]}"
     --offline
     --out-dir "$OUT_DIR"
+    --batch-size "$BATCH_SIZE"
+    --grad-accum "$GRAD_ACCUM"
     --num-workers 8
     --queue-size 25
     --stop-after-one-epoch
+    --no-compile
 )
 TRAIN_ARGS+=("${LOCAL_DIR_ARGS[@]}")
 

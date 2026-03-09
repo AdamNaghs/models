@@ -80,12 +80,12 @@ from fineweb_gpt_common import GPT, tokenizer_fingerprint, unwrap_model
 PRESETS = {
     "125m": {
         "train_steps": 20000,
-        "batch_size": 64,
+        "batch_size": 8,
         "context": 2048,
         "n_layer": 12,
         "n_head": 12,
         "n_embd": 768,
-        "grad_accum": 2,
+        "grad_accum": 16,
         "lr": 6e-4,
         "min_lr": 6e-5,
         "warmup_steps": 1000,
@@ -237,6 +237,8 @@ def parse_args():
                    help="Path to SentencePiece .model file (auto-built if missing)")
     p.add_argument("--seed-docs", type=int, default=50000,
                    help="Number of docs streamed to build tokenizer if missing")
+    p.add_argument("--no-compile", action="store_true", default=False,
+                   help="Disable torch.compile (useful when compile-time memory overhead is too high)")
 
     # Data loading infrastructure.
     p.add_argument("--queue-size", type=int, default=64, help="Prefetch queue size for batchers")
@@ -1389,7 +1391,7 @@ def main():
             print(f"Resumed at step {start_step}")
 
     # --- torch.compile (skip on Windows due to triton issues) ---
-    if is_cuda and platform.system() != "Windows":
+    if is_cuda and not args.no_compile and platform.system() != "Windows":
         if is_main:
             print("Compiling model with torch.compile (this takes 60-120s on first run)...")
         try:
@@ -1397,6 +1399,8 @@ def main():
         except Exception:
             if is_main:
                 print("torch.compile failed, continuing without compilation")
+    elif is_main and args.no_compile:
+        print("Skipping torch.compile (--no-compile)")
 
     # --- DDP wrapping ---
     if is_distributed:
