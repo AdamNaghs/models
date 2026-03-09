@@ -21,8 +21,12 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
-OUT_DIR="${OUT_DIR:-runs/350m}"
-mkdir -p "$OUT_DIR"
+PRESET="${PRESET:-350m}"
+STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
+OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/$PRESET}"
+CONFIG="${CONFIG:-CC-MAIN-2025-26}"
+CACHE_DIR="${CACHE_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/$PRESET}"
+mkdir -p "$OUT_DIR" "$CACHE_DIR"
 
 # Activate your environment (edit if needed)
 source llmvenv/bin/activate
@@ -34,6 +38,9 @@ nvidia-smi
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 
 echo "Artifacts will be written to: $OUT_DIR"
+echo "Preset: $PRESET"
+echo "Storage root: $STORAGE_ROOT"
+echo "Dataset cache will be written to: $CACHE_DIR"
 
 # =============================================================================
 # Stage 1: Pretraining
@@ -42,8 +49,10 @@ echo "========== STAGE 1: PRETRAINING =========="
 echo "Start: $(date)"
 
 torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
-    --preset 350m \
+    --preset "$PRESET" \
+    --config "$CONFIG" \
     --out-dir "$OUT_DIR" \
+    --cache-dir "$CACHE_DIR" \
     --cache-gb 500 \
     --num-workers 8 \
     --queue-size 25
