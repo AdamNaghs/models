@@ -135,6 +135,7 @@ PRESETS = {
 # configs. We never download the full dataset -- only individual configs
 # (CommonCrawl snapshots) via streaming or rolling cache.
 HF_DATASET = "HuggingFaceFW/fineweb-edu"
+DEFAULT_STORAGE_ROOT = os.environ.get("FINEWEB_STORAGE_ROOT", "/fs1/proj/educational_web_data")
 
 # Global shutdown event for graceful SIGTERM/SIGINT handling.
 # Worker threads check this periodically to drain cleanly.
@@ -144,6 +145,18 @@ _shutdown = threading.Event()
 def _signal_handler(signum, frame):
     """Set shutdown event on SIGTERM/SIGINT so worker threads drain cleanly."""
     _shutdown.set()
+
+
+def default_out_dir(preset: str | None) -> str:
+    """Default artifact directory under the shared project storage root."""
+    stage = preset if preset else "custom"
+    return os.path.join(DEFAULT_STORAGE_ROOT, "runs", stage)
+
+
+def default_cache_dir(config: str, preset: str | None) -> str:
+    """Keep rolling-cache shards under the shared bulk-storage dataset tree."""
+    stage = preset if preset else "custom"
+    return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, stage)
 
 
 # =============================================================================
@@ -228,7 +241,7 @@ def parse_args():
     # Output directory.
     p.add_argument("--out-dir", type=str, default=None,
                    help="Output directory for checkpoints and tokenizer "
-                        "(default: runs/<preset> or runs/custom if no preset)")
+                        "(default: <storage-root>/runs/<preset> or <storage-root>/runs/custom)")
 
     # Checkpoint resume.
     p.add_argument("--resume", type=str, default=None,
@@ -287,7 +300,7 @@ def parse_args():
 
     # Resolve output directory (after preset so we know the preset name).
     if args.out_dir is None:
-        args.out_dir = os.path.join("runs", args.preset if args.preset else "custom")
+        args.out_dir = default_out_dir(args.preset)
 
     # Default tokenizer path inside out_dir (unless user explicitly set it).
     if "--tokenizer-model" not in explicit_flags:
@@ -295,7 +308,7 @@ def parse_args():
 
     # Default cache dir inside out_dir (unless user explicitly set it).
     if "--cache-dir" not in explicit_flags:
-        args.cache_dir = os.path.join(args.out_dir, ".data_cache")
+        args.cache_dir = default_cache_dir(args.config, args.preset)
 
     return args
 
