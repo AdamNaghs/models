@@ -25,6 +25,7 @@ OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/760m}"
 CONFIG="${CONFIG:-CC-MAIN-2025-26}"
 CACHE_GB="${CACHE_GB:-500}"
 NPROC="${NPROC:-8}"
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/source}"
 CACHE_DIR="${CACHE_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/$PRESET}"
 
 mkdir -p "$LOG_DIR" "$OUT_DIR" "$CACHE_DIR"
@@ -43,6 +44,7 @@ echo "Config: $CONFIG"
 echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Artifacts will be written to: $OUT_DIR"
+echo "Local staged data dir: $LOCAL_DATA_DIR"
 echo "Dataset cache will be written to: $CACHE_DIR"
 
 echo "========== STAGE 1: PRETRAINING =========="
@@ -51,6 +53,8 @@ echo "Start: $(date)"
 torchrun --standalone --nproc_per_node="$NPROC" train_fineweb_gpt.py \
     --preset "$PRESET" \
     --config "$CONFIG" \
+    --offline \
+    --local-data-dir "$LOCAL_DATA_DIR" \
     --out-dir "$OUT_DIR" \
     --cache-dir "$CACHE_DIR" \
     --cache-gb "$CACHE_GB" \

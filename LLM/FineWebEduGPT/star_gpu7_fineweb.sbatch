@@ -23,6 +23,7 @@ STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/$PRESET}"
 CONFIG="${CONFIG:-CC-MAIN-2025-26}"
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/source}"
 CACHE_DIR="${CACHE_DIR:-$STORAGE_ROOT/dataset/fineweb-edu/$CONFIG/$PRESET}"
 mkdir -p "$LOG_DIR" "$OUT_DIR" "$CACHE_DIR"
 cd "$SLURM_SUBMIT_DIR"
@@ -41,6 +42,7 @@ echo "Preset: $PRESET"
 echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Dataset cache will be written to: $CACHE_DIR"
+echo "Local staged data dir: $LOCAL_DATA_DIR"
 
 # =============================================================================
 # Stage 1: Pretraining
@@ -51,6 +53,8 @@ echo "Start: $(date)"
 torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
     --preset "$PRESET" \
     --config "$CONFIG" \
+    --offline \
+    --local-data-dir "$LOCAL_DATA_DIR" \
     --out-dir "$OUT_DIR" \
     --cache-dir "$CACHE_DIR" \
     --cache-gb 500 \

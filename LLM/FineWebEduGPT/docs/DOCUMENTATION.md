@@ -282,6 +282,19 @@ python train_fineweb_gpt.py -350M --cache-gb 5
 - Trains through it, rotates chunk, continues.
 - Good middle ground between storage and throughput.
 
+### D) Offline staged parquet mode
+
+```bash
+python train_fineweb_gpt.py -350M \
+  --offline \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --cache-gb 500
+```
+
+- Uses only staged local parquet shards.
+- Never calls HuggingFace when `--offline` is set.
+- Intended mode for Star compute nodes with no outbound network access.
+
 ### Train/Val split behavior
 
 For non-rolling local mode, the loader performs a held-out split:
@@ -299,10 +312,11 @@ SentencePiece BPE is used for pretraining, finetuning, and inference.
 ### Auto-build flow
 
 If `<out_dir>/tokenizer.model` is missing:
-1. Stream `--seed-docs` documents from current FineWeb config.
-2. Write text to `tokenizer_seed.txt`.
-3. Train SentencePiece with configured `--vocab-size`.
-4. Save `tokenizer.model` and `tokenizer.vocab` under `OUT_DIR`.
+1. If `--local-data-dir` is set, read `--seed-docs` documents from staged local parquet.
+2. Otherwise stream `--seed-docs` documents from current FineWeb config.
+3. Write text to `tokenizer_seed.txt`.
+4. Train SentencePiece with configured `--vocab-size`.
+5. Save `tokenizer.model` and `tokenizer.vocab` under `OUT_DIR`.
 
 ### Special token IDs
 
@@ -316,6 +330,18 @@ If `<out_dir>/tokenizer.model` is missing:
 ### DDP behavior
 
 Rank 0 builds tokenizer, then `dist.barrier()` gates other ranks before load.
+
+### Offline requirements
+
+For Star HPC offline runs, stage data under:
+
+```text
+/fs1/proj/educational_web_data/runs/<preset>/tokenizer.model
+/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source/**/*.parquet
+/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/<preset>/...
+```
+
+If `--offline` is set and either `tokenizer.model` or staged parquet shards are missing, the trainer fails fast with a path-specific error instead of attempting a network fallback.
 
 ---
 

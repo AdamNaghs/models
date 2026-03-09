@@ -81,6 +81,7 @@ python train_fineweb_gpt.py -1.3B
 - **Default**: downloads the full dataset to local cache, then trains from memory-mapped Arrow files. Fastest throughput.
 - **`--stream`**: reads directly from HuggingFace Hub. No disk usage, but slower and network-dependent.
 - **`--cache-gb N`**: rolling cache mode. Downloads N GB of data, trains on it, deletes it, downloads the next chunk. Good for limited disk space.
+- **`--offline --local-data-dir PATH`**: reads staged local parquet shards with no HuggingFace access. This is the intended Star HPC mode.
 
 ```bash
 # Full download (run once, then train)
@@ -91,6 +92,12 @@ python train_fineweb_gpt.py -350M --stream
 
 # Rolling cache (5 GB at a time)
 python train_fineweb_gpt.py -350M --cache-gb 5
+
+# Offline staged parquet (no network)
+python train_fineweb_gpt.py -350M \
+  --offline \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --cache-gb 500
 ```
 
 ### Multi-GPU (torchrun)
@@ -105,6 +112,31 @@ python train_fineweb_gpt.py -350M --cache-gb 5
 ```bash
 OUT_DIR=runs/350m
 python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/fineweb_gpt.ckpt"
+```
+
+### Star HPC Offline Layout
+
+Stage these assets before submitting on Star:
+
+```text
+/fs1/proj/educational_web_data/runs/<preset>/tokenizer.model
+/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source/**/*.parquet
+/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/<preset>/...
+```
+
+The preset sbatch files now submit the trainer with:
+
+```bash
+--offline --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source
+```
+
+Use explicit Slurm log paths when submitting:
+
+```bash
+sbatch --qos=long2x \
+  -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
+  star_gpu7_fineweb_125m.sbatch
 ```
 
 ## Chat Finetuning

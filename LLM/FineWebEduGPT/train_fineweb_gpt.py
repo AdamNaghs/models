@@ -42,6 +42,7 @@ import shutil
 import sys
 import threading
 import time
+import tempfile
 from collections import deque
 from contextlib import nullcontext
 
@@ -161,6 +162,11 @@ def default_cache_dir(config: str, preset: str | None) -> str:
     return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, stage)
 
 
+def resolve_local_data_dir(config: str) -> str:
+    """Default staged FineWeb source data directory for offline/HPC runs."""
+    return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, "source")
+
+
 # =============================================================================
 # Argument Parsing
 # =============================================================================
@@ -239,6 +245,10 @@ def parse_args():
                         "deletes, and downloads the next chunk. (0 = use full config download)")
     p.add_argument("--cache-dir", type=str, default=".data_cache",
                    help="Directory for rolling cache parquet files")
+    p.add_argument("--offline", action="store_true", default=False,
+                   help="Disable HuggingFace network access and require local staged data/tokenizer")
+    p.add_argument("--local-data-dir", type=str, default=None,
+                   help="Directory containing staged FineWeb parquet shards (searched recursively)")
 
     # Output directory.
     p.add_argument("--out-dir", type=str, default=None,
@@ -293,6 +303,7 @@ def parse_args():
         "num_workers": {"--num-workers"},
         "seed_docs": {"--seed-docs"},
         "log_every": {"--log-every"},
+        "local_data_dir": {"--local-data-dir"},
     }
 
     if args.preset:
@@ -311,6 +322,9 @@ def parse_args():
     # Default cache dir inside out_dir (unless user explicitly set it).
     if "--cache-dir" not in explicit_flags:
         args.cache_dir = default_cache_dir(args.config, args.preset)
+
+    if args.local_data_dir is not None:
+        args.local_data_dir = os.path.abspath(args.local_data_dir)
 
     return args
 
@@ -334,11 +348,65 @@ def estimate_params(vocab, context, n_embd, n_layer):
     )
 
 
+def discover_local_parquet_files(local_data_dir, *, required=False):
+    """Recursively discover staged parquet shards under a local source tree."""
+    if not local_data_dir:
+        if required:
+            raise RuntimeError("Local parquet data is required but --local-data-dir was not provided.")
+        return []
+
+    root = os.path.abspath(local_data_dir)
+    parquet_files = sorted(glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True))
+    if required and not parquet_files:
+        raise RuntimeError(
+            f"No parquet files found under local data dir: {root}\n"
+            "Stage FineWeb shards under this path or disable --offline."
+        )
+    return parquet_files
+
+
+def load_local_parquet_dataset(local_data_dir, *, is_main=False, label="data"):
+    """Load a staged parquet tree into an Arrow-backed HuggingFace Dataset."""
+    parquet_files = discover_local_parquet_files(local_data_dir, required=True)
+    if is_main:
+        print(f"{label}: loading {len(parquet_files)} staged parquet files from {local_data_dir}...")
+
+    from datasets import Dataset
+
+    tables = [pq.read_table(path, columns=["text"]) for path in parquet_files]
+    combined = pa.concat_tables(tables)
+    ds = Dataset(combined)
+
+    if is_main:
+        print(f"{label}: {len(ds):,} documents loaded from staged local parquet")
+    return ds
+
+
+def write_tokenizer_seed_from_parquet(seed_path, parquet_files, seed_docs):
+    """Write tokenizer seed text from staged parquet shards."""
+    written = 0
+    with open(seed_path, "w", encoding="utf-8") as f:
+        for parquet_path in parquet_files:
+            pf = pq.ParquetFile(parquet_path)
+            for batch in pf.iter_batches(columns=["text"], batch_size=512):
+                texts = batch.column(0).to_pylist()
+                for text in texts:
+                    text = (text or "").strip()
+                    if not text:
+                        continue
+                    f.write(text + "\n")
+                    written += 1
+                    if written >= seed_docs:
+                        return written
+    return written
+
+
 def ensure_tokenizer(args, is_main=True):
     """Load or build a SentencePiece BPE tokenizer.
 
     If the tokenizer .model file exists, loads it directly. Otherwise,
-    streams seed_docs documents from HuggingFace to build a new tokenizer.
+    builds from local staged parquet or streams seed_docs documents from
+    HuggingFace as a fallback.
     In distributed training, only rank 0 builds; other ranks wait at barrier.
     """
     tok_model = args.tokenizer_model
@@ -358,28 +426,64 @@ def ensure_tokenizer(args, is_main=True):
     except Exception:
         pass
 
+    local_parquet_files = discover_local_parquet_files(args.local_data_dir, required=False)
+
     # Build tokenizer from streamed data (rank 0 only).
     if is_main:
-        print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
-        seed_path = "tokenizer_seed.txt"
-        ds = load_dataset(HF_DATASET, args.config, split="train", streaming=True)
-        with open(seed_path, "w", encoding="utf-8") as f:
-            for ex in itertools.islice(ds, args.seed_docs):
-                t = (ex.get("text") or "").strip()
-                if t:
-                    f.write(t + "\n")
-
-        spm.SentencePieceTrainer.train(
-            input=seed_path,
-            model_prefix=prefix,
-            vocab_size=args.vocab_size,
-            model_type="bpe",
-            character_coverage=1.0,
-            bos_id=1,
-            eos_id=2,
-            pad_id=3,
-            unk_id=0,
+        os.makedirs(os.path.dirname(os.path.abspath(tok_model)) or ".", exist_ok=True)
+        fd, seed_path = tempfile.mkstemp(
+            prefix="tokenizer_seed_",
+            suffix=".txt",
+            dir=os.path.dirname(os.path.abspath(tok_model)) or None,
+            text=True,
         )
+        os.close(fd)
+        wrote_seed = 0
+        try:
+            if local_parquet_files:
+                print(
+                    f"Tokenizer missing. Building from first {args.seed_docs:,} docs "
+                    f"in staged local parquet: {args.local_data_dir}"
+                )
+                wrote_seed = write_tokenizer_seed_from_parquet(seed_path, local_parquet_files, args.seed_docs)
+            elif args.offline:
+                raise RuntimeError(
+                    "Tokenizer missing and offline mode is enabled.\n"
+                    f"Expected tokenizer at: {tok_model}\n"
+                    f"Expected staged parquet under: {args.local_data_dir or resolve_local_data_dir(args.config)}"
+                )
+            else:
+                print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
+                ds = load_dataset(HF_DATASET, args.config, split="train", streaming=True)
+                with open(seed_path, "w", encoding="utf-8") as f:
+                    for ex in itertools.islice(ds, args.seed_docs):
+                        t = (ex.get("text") or "").strip()
+                        if t:
+                            f.write(t + "\n")
+                            wrote_seed += 1
+
+            if wrote_seed == 0:
+                raise RuntimeError(
+                    "Unable to collect any tokenizer seed documents.\n"
+                    f"Checked local data dir: {args.local_data_dir or '(unset)'}"
+                )
+
+            spm.SentencePieceTrainer.train(
+                input=seed_path,
+                model_prefix=prefix,
+                vocab_size=args.vocab_size,
+                model_type="bpe",
+                character_coverage=1.0,
+                bos_id=1,
+                eos_id=2,
+                pad_id=3,
+                unk_id=0,
+            )
+        finally:
+            try:
+                os.remove(seed_path)
+            except OSError:
+                pass
 
     # Wait for rank 0 to finish building before other ranks try to load.
     if dist.is_initialized():
@@ -650,7 +754,7 @@ class StreamingBatcher:
 # Downloads N GB of parquet shards -> trains on them -> deletes -> downloads
 # the next batch of shards. This way you never need the full dataset on disk.
 
-def _list_parquet_urls(config):
+def _list_hf_parquet_urls(config):
     """List all parquet file URLs for a FineWeb-Edu config via HF Hub API.
 
     Uses HfApi.list_repo_tree() to discover shard files. We never guess
@@ -678,6 +782,11 @@ def _list_parquet_urls(config):
         )
 
 
+def list_staged_parquet_shards(local_data_dir):
+    """List all staged local parquet shards for a FineWeb config."""
+    return discover_local_parquet_files(local_data_dir, required=True)
+
+
 def _load_cache_state(state_path):
     """Load rolling cache progress state from disk."""
     if os.path.exists(state_path):
@@ -699,7 +808,7 @@ def _save_cache_state(state_path, state):
     os.replace(tmp_path, state_path)
 
 
-def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
+def _download_hf_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
     """Download parquet shards into cache_dir up to max_bytes total size."""
     from huggingface_hub import hf_hub_download
 
@@ -729,6 +838,40 @@ def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
             continue
 
     return downloaded
+
+
+def _materialize_local_shard_batch(shard_paths, cache_dir, max_bytes, source_root, is_main=True):
+    """Materialize local parquet shards into cache_dir up to max_bytes total size."""
+    os.makedirs(cache_dir, exist_ok=True)
+    materialized = []
+    total_bytes = 0
+
+    for src_path in shard_paths:
+        try:
+            fsize = os.path.getsize(src_path)
+        except OSError as e:
+            if is_main:
+                print(f"  skip: {src_path} ({e})")
+            continue
+
+        if materialized and total_bytes + fsize > max_bytes:
+            break
+
+        rel_path = os.path.relpath(src_path, source_root)
+        dst_path = os.path.join(cache_dir, rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+        try:
+            os.link(src_path, dst_path)
+        except OSError:
+            shutil.copy2(src_path, dst_path)
+
+        total_bytes += fsize
+        materialized.append(dst_path)
+        if is_main:
+            print(f"  staged: {src_path} ({fsize / 1e9:.2f} GB, total: {total_bytes / 1e9:.2f} GB)")
+
+    return materialized
 
 
 def _clear_cache_data(cache_dir, is_main=True):
@@ -776,6 +919,8 @@ class RollingCacheBatcher:
         self.is_distributed = dist.is_initialized()
         self.cache_dir = args.cache_dir
         self.max_bytes = int(args.cache_gb * 1e9)
+        self.local_data_dir = args.local_data_dir
+        self.source_backend = "local" if args.local_data_dir else "hf"
 
         # State file lives outside cache_dir so it survives cache clears.
         self.state_path = os.path.join(
@@ -793,12 +938,18 @@ class RollingCacheBatcher:
 
         # Rank 0 discovers all available shards and broadcasts the list.
         if is_main:
-            self._all_shards = _list_parquet_urls(args.config)
+            if self.source_backend == "local":
+                self._all_shards = list_staged_parquet_shards(self.local_data_dir)
+            else:
+                self._all_shards = _list_hf_parquet_urls(args.config)
             shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
             os.makedirs(self.cache_dir, exist_ok=True)
             with open(shard_list_path, "w") as f:
                 json.dump(self._all_shards, f)
-            print(f"cache: found {len(self._all_shards)} parquet shards for {args.config}")
+            if self.source_backend == "local":
+                print(f"cache: found {len(self._all_shards)} staged parquet shards in {self.local_data_dir}")
+            else:
+                print(f"cache: found {len(self._all_shards)} parquet shards for {args.config}")
 
         if self.is_distributed:
             dist.barrier()
@@ -874,9 +1025,19 @@ class RollingCacheBatcher:
         # Rank 0 downloads; other ranks wait at barrier.
         if self.is_main:
             _clear_cache_data(self.cache_dir, is_main=True)
-            downloaded = _download_shard_batch(remaining, self.cache_dir, self.max_bytes, is_main=True)
+            if self.source_backend == "local":
+                downloaded = _materialize_local_shard_batch(
+                    remaining,
+                    self.cache_dir,
+                    self.max_bytes,
+                    self.local_data_dir,
+                    is_main=True,
+                )
+            else:
+                downloaded = _download_hf_shard_batch(remaining, self.cache_dir, self.max_bytes, is_main=True)
             n_downloaded = len(downloaded)
-            print(f"cache: downloaded {n_downloaded} shards into {self.cache_dir}")
+            action = "materialized" if self.source_backend == "local" else "downloaded"
+            print(f"cache: {action} {n_downloaded} shards into {self.cache_dir}")
 
             self._state["current_shard_idx"] = idx
             self._state["next_shard_idx"] = (
@@ -986,10 +1147,58 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
     """Create the appropriate batcher based on the data loading mode.
 
     Priority:
-      1. --stream: Network streaming (no disk needed).
-      2. --cache-gb N: Rolling cache (N GB at a time).
-      3. Default: Load full config into HF local cache (fastest).
+      1. --local-data-dir: use staged local parquet shards.
+      2. --stream: Network streaming (no disk needed).
+      3. --cache-gb N: Rolling cache (N GB at a time).
+      4. Default: Load full config into HF local cache (fastest).
     """
+    if args.local_data_dir:
+        qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
+        nw = max(1, args.num_workers // 2) if is_val else args.num_workers
+
+        if args.cache_gb > 0:
+            if is_val:
+                return None  # Val batcher created from cache's held-out set.
+            if is_main:
+                mode = "offline local rolling-cache" if args.offline else "local rolling-cache"
+                print(f"data: {mode} mode ({args.cache_gb} GB per chunk)")
+            return RollingCacheBatcher(
+                sp, args, rank=rank, world_size=world_size,
+                is_main=is_main, is_val=False,
+            )
+
+        ds = None
+        if is_main:
+            ds = load_local_parquet_dataset(args.local_data_dir, is_main=True, label="data")
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        if ds is None:
+            ds = load_local_parquet_dataset(args.local_data_dir, is_main=False, label="data")
+
+        n_val = max(100, len(ds) // 100)
+        if is_val:
+            val_ds = ds.select(range(len(ds) - n_val, len(ds)))
+            if is_main:
+                print(f"data(val): using {len(val_ds):,} held-out docs from staged local parquet")
+            return LocalBatcher(
+                sp, val_ds, args.context, args.batch_size,
+                queue_size=qsize, num_workers=nw,
+                rank=rank, world_size=world_size,
+                seed=args.seed + 9999,
+            )
+
+        train_ds = ds.select(range(len(ds) - n_val))
+        if is_main:
+            print(f"data(train): {len(train_ds):,} docs from staged local parquet (reserved {n_val:,} for val)")
+        return LocalBatcher(
+            sp, train_ds, args.context, args.batch_size,
+            queue_size=qsize, num_workers=nw,
+            rank=rank, world_size=world_size,
+            seed=args.seed,
+        )
+
     if args.stream:
         if is_main and not is_val:
             print("data: streaming from HuggingFace Hub")
@@ -1064,6 +1273,13 @@ def main():
 
     args = parse_args()
 
+    if args.offline and not args.local_data_dir:
+        raise ValueError(
+            "--offline requires --local-data-dir pointing at staged FineWeb parquet shards."
+        )
+    if args.offline and args.stream:
+        raise ValueError("--offline cannot be combined with --stream.")
+
     # --- Distributed training setup ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1129,6 +1345,10 @@ def main():
             if is_main:
                 print(f"data(val): using {len(val_ds):,} held-out docs from cache chunk")
         else:
+            if args.offline:
+                raise RuntimeError(
+                    "Offline mode requested but no held-out validation data was available from the local rolling cache."
+                )
             # Fallback: stream validation data if no held-out set available.
             val_batcher = StreamingBatcher(
                 sp, args.config, args.context, args.batch_size,
@@ -1273,7 +1493,11 @@ def main():
     est = estimate_params(vocab, args.context, args.n_embd, args.n_layer)
     tokens_per_step = args.batch_size * args.context * args.grad_accum * world_size
 
-    if args.cache_gb > 0:
+    if args.local_data_dir and args.cache_gb > 0:
+        data_mode = f"local-rolling-cache({args.cache_gb}GB)"
+    elif args.local_data_dir:
+        data_mode = "local-staged"
+    elif args.cache_gb > 0:
         data_mode = f"rolling-cache({args.cache_gb}GB)"
     elif args.stream:
         data_mode = "streaming"
