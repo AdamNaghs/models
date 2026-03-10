@@ -58,6 +58,13 @@ def main():
     is_finetuned = "chat_format" in ckpt
     if args.raw:
         is_finetuned = False
+    chat_format = ckpt.get(
+        "chat_format",
+        {"user_prefix": USER_PREFIX, "asst_prefix": ASST_PREFIX, "turn_suffix": TURN_SUFFIX},
+    )
+    user_prefix = chat_format["user_prefix"]
+    asst_prefix = chat_format["asst_prefix"]
+    turn_suffix = chat_format["turn_suffix"]
 
     model = GPT(
         vocab=ckpt["vocab"],
@@ -80,8 +87,8 @@ def main():
     eos_id = sp.eos_id()
     stop_tokens = {eos_id} if eos_id >= 0 else set()
     stop_sequences = [
-        sp.encode("### User:", out_type=int),
-        sp.encode("### Assistant:", out_type=int),
+        sp.encode(user_prefix.strip(), out_type=int),
+        sp.encode(asst_prefix.strip(), out_type=int),
     ]
 
     mode_str = "chat (finetuned)" if is_finetuned else "completion (pretrained)"
@@ -124,10 +131,10 @@ def main():
             prompt = ""
             for msg in recent:
                 if msg["role"] == "user":
-                    prompt += USER_PREFIX + msg["content"] + TURN_SUFFIX
+                    prompt += user_prefix + msg["content"] + turn_suffix
                 elif msg["role"] == "assistant":
-                    prompt += ASST_PREFIX + msg["content"] + TURN_SUFFIX
-            prompt += ASST_PREFIX
+                    prompt += asst_prefix + msg["content"] + turn_suffix
+            prompt += asst_prefix
 
             ids = sp.encode(prompt, out_type=int)
             # Truncate from the left if too long (keep recent context).
@@ -147,7 +154,7 @@ def main():
             reply = sp.decode(generated).strip()
 
             # Clean up: remove trailing ### or partial markers.
-            for marker in ["### User:", "### Assistant:", "###"]:
+            for marker in [user_prefix.strip(), asst_prefix.strip(), "###"]:
                 if marker in reply:
                     reply = reply[:reply.index(marker)].strip()
 
@@ -163,7 +170,7 @@ def main():
 
         else:
             # Raw completion mode.
-            prompt = f"User: {q}\nAssistant:"
+            prompt = q
             prompt_ids = sp.encode(prompt, out_type=int)
             idx = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
             out = model.generate(
@@ -173,7 +180,11 @@ def main():
                 stop_sequences=stop_sequences,
             )
             generated = out[0].tolist()[len(prompt_ids):]
-            reply = sp.decode(generated).split("\n")[0].strip()
+            reply = sp.decode(generated).strip()
+            for marker in [user_prefix.strip(), asst_prefix.strip(), "###"]:
+                if marker and marker in reply:
+                    reply = reply[:reply.index(marker)].strip()
+            reply = reply.replace("</s>", "").strip()
             print(f"Assistant: {reply if reply else '...'}")
 
         print()
