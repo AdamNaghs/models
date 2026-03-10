@@ -1309,6 +1309,7 @@ def main():
         dist.init_process_group(
             backend=backend,
             device_id=torch.device(device) if backend == "nccl" else None,
+            timeout=timedelta(hours=2),
         )
 
     is_main = (rank == 0)
