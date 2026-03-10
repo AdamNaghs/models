@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 from typing import Any
 
 from huggingface_hub import HfApi, hf_hub_download
@@ -108,14 +107,65 @@ def save_json(path: str, payload: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def clear_directory(path: str) -> None:
+def load_existing_manifest(output_dir: str) -> dict[str, Any] | None:
+    manifest_path = os.path.join(output_dir, "_chunk_manifest.json")
+    if not os.path.exists(manifest_path):
+        return None
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def expected_local_path(output_dir: str, shard_path: str) -> str:
+    return os.path.join(output_dir, shard_path)
+
+
+def select_chunk(shards: list[dict[str, Any]], start_idx: int, max_bytes: int) -> list[dict[str, Any]]:
+    selected = []
+    total_bytes = 0
+    for shard in shards[start_idx:]:
+        estimated = shard.get("size")
+        if selected and estimated and total_bytes + estimated > max_bytes:
+            break
+        selected.append(shard)
+        if estimated:
+            total_bytes += estimated
+        if total_bytes >= max_bytes:
+            break
+    return selected
+
+
+def clear_directory_except(path: str, keep_rel_paths: set[str]) -> None:
     os.makedirs(path, exist_ok=True)
-    for entry in os.listdir(path):
-        full_path = os.path.join(path, entry)
-        if os.path.isdir(full_path):
-            shutil.rmtree(full_path, ignore_errors=True)
-        else:
+    for root, _dirs, files in os.walk(path):
+        for filename in files:
+            if filename == ".gitkeep":
+                continue
+            full_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(full_path, path)
+            if rel_path in keep_rel_paths:
+                continue
             os.remove(full_path)
+
+
+def cleanup_empty_dirs(path: str) -> None:
+    for root, dirs, _files in os.walk(path, topdown=False):
+        for dirname in dirs:
+            full_path = os.path.join(root, dirname)
+            try:
+                os.rmdir(full_path)
+            except OSError:
+                pass
+
+
+def is_usable_local_shard(path: str, expected_size: int | None) -> bool:
+    if not os.path.exists(path):
+        return False
+    actual_size = os.path.getsize(path)
+    if actual_size <= 0:
+        return False
+    if expected_size is not None and actual_size != expected_size:
+        return False
+    return True
 
 
 def stage_config(config: str, *, max_gb: float, output_dir: str, state_path: str, reset: bool) -> dict[str, Any]:
@@ -137,18 +187,72 @@ def stage_config(config: str, *, max_gb: float, output_dir: str, state_path: str
             "total_bytes": 0,
         }
 
-    clear_directory(output_dir)
+    selected_shards = select_chunk(shards, start_idx, max_bytes)
+    if not selected_shards:
+        raise RuntimeError(f"No shards selected for {config} starting at shard index {start_idx}.")
+
+    existing_manifest = load_existing_manifest(output_dir)
+    expected_rel_paths = {shard["path"] for shard in selected_shards}
+    expected_rel_paths.add("_chunk_manifest.json")
+
+    if existing_manifest:
+        manifest_paths = [item["path"] for item in existing_manifest.get("downloaded", [])]
+        manifest_matches = (
+            int(existing_manifest.get("current_shard_idx", -1)) == start_idx
+            and manifest_paths == [shard["path"] for shard in selected_shards]
+            and all(
+                is_usable_local_shard(
+                    expected_local_path(output_dir, shard["path"]),
+                    shard.get("size"),
+                )
+                for shard in selected_shards
+            )
+        )
+        if manifest_matches:
+            next_idx = int(existing_manifest["next_shard_idx"])
+            total_bytes = int(existing_manifest.get("total_bytes", 0))
+            state.update(
+                {
+                    "next_shard_idx": next_idx,
+                    "last_chunk_start_idx": start_idx,
+                    "last_chunk_end_idx": next_idx,
+                    "total_shards": len(shards),
+                    "completed": next_idx >= len(shards),
+                }
+            )
+            save_json(state_path, state)
+            print(f"{config}: reusing already staged chunk in {output_dir}")
+            print(f"{config}: shard range [{start_idx}, {next_idx}) is already present on disk.")
+            print()
+            return {
+                "config": config,
+                "output_dir": output_dir,
+                "state_path": state_path,
+                "completed": next_idx >= len(shards),
+                "next_shard_idx": next_idx,
+                "total_shards": len(shards),
+                "total_bytes": total_bytes,
+            }
+
+    clear_directory_except(output_dir, expected_rel_paths)
+    cleanup_empty_dirs(output_dir)
     print(f"Staging shards for {config} into {output_dir}")
     print(f"Starting at shard index {start_idx} of {len(shards)}")
 
     downloaded = []
     total_bytes = 0
 
-    for shard in shards[start_idx:]:
+    for shard in selected_shards:
         shard_path = shard["path"]
-        estimated = shard.get("size")
-        if downloaded and estimated and total_bytes + estimated > max_bytes:
-            break
+        local_path = expected_local_path(output_dir, shard_path)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+        if is_usable_local_shard(local_path, shard.get("size")):
+            actual_size = os.path.getsize(local_path)
+            total_bytes += actual_size
+            downloaded.append({"path": shard_path, "local_path": local_path, "size": actual_size})
+            print(f"  reusing:    {shard_path} ({actual_size / 1e9:.2f} GB, total {total_bytes / 1e9:.2f} GB)")
+            continue
 
         local_path = hf_hub_download(
             repo_id=HF_DATASET,
@@ -162,9 +266,6 @@ def stage_config(config: str, *, max_gb: float, output_dir: str, state_path: str
         total_bytes += actual_size
         downloaded.append({"path": shard_path, "local_path": local_path, "size": actual_size})
         print(f"  downloaded: {shard_path} ({actual_size / 1e9:.2f} GB, total {total_bytes / 1e9:.2f} GB)")
-
-        if total_bytes >= max_bytes:
-            break
 
     if not downloaded:
         raise RuntimeError(f"No shards were downloaded for {config}. Check network access and output directory permissions.")
