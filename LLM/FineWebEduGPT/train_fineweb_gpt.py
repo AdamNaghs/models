@@ -3,25 +3,15 @@ FineWebEduGPT Training Script
 ==============================
 Trains a GPT-class language model on the HuggingFace FineWeb-Edu dataset.
 
-Supports three data loading modes:
-  1. Rolling cache (--cache-gb N): Downloads N GB of shards, trains on them,
-     deletes, and fetches the next chunk. Best for limited disk space.
-  2. Streaming (--stream): Streams directly from HuggingFace Hub with zero
-     local storage. Slowest but requires no disk.
-  3. Local staged parquet (--offline --local-data-dir PATH): Trains from a
-     manually staged chunk of parquet files with no network access.
-  4. Local (default): Loads the dataset config into HF's local cache and
-     trains from memory-mapped Arrow files. Fastest throughput.
+Supported data loading modes:
+  1. Local staged parquet (--offline --local-data-dir PATH): Trains from
+     manually staged chunks of parquet files with no network access.
+  2. Local (default): Loads the selected dataset config into HF's local cache
+     and trains from Arrow-backed files.
 
 Multi-GPU training via PyTorch DDP (torchrun --nproc_per_node=N).
 
 Usage examples:
-  # Single GPU, 350M preset, rolling cache
-  python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m
-
-  # Multi-GPU (8x H100), 1.3B preset, streaming mode
-  torchrun --nproc_per_node=8 train_fineweb_gpt.py -1.3B --stream --out-dir runs/1.3b
-
   # Offline staged chunk from shared storage
   torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
       --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
@@ -35,7 +25,10 @@ Usage examples:
       --out-dir /fs1/proj/educational_web_data/runs/125m
 
   # Resume from checkpoint
-  python train_fineweb_gpt.py -350M --cache-gb 5 --out-dir runs/350m --resume runs/350m/fineweb_gpt.ckpt
+  torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
+      --resume /fs1/proj/educational_web_data/runs/125m/fineweb_gpt.ckpt \
+      --out-dir /fs1/proj/educational_web_data/runs/125m
 """
 
 from __future__ import annotations
@@ -45,14 +38,12 @@ from datetime import timedelta
 import argparse
 import glob
 import itertools
-import json
 import math
 import os
 import platform
 import queue
 import random
 import signal
-import shutil
 import sys
 import threading
 import time
@@ -60,7 +51,6 @@ import tempfile
 from collections import deque
 from contextlib import nullcontext
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 import sentencepiece as spm
 import torch
@@ -150,7 +140,7 @@ PRESETS = {
 
 # HuggingFace dataset identifier. FineWeb-Edu is ~10TB total across all
 # configs. We never download the full dataset -- only individual configs
-# (CommonCrawl snapshots) via streaming or rolling cache.
+# (CommonCrawl snapshots) or staged local parquet chunks.
 HF_DATASET = "HuggingFaceFW/fineweb-edu"
 DEFAULT_STORAGE_ROOT = os.environ.get("FINEWEB_STORAGE_ROOT", "/fs1/proj/educational_web_data")
 
@@ -170,12 +160,6 @@ def default_out_dir(preset: str | None) -> str:
     return os.path.join(DEFAULT_STORAGE_ROOT, "runs", stage)
 
 
-def default_cache_dir(config: str, preset: str | None) -> str:
-    """Keep rolling-cache shards under the shared bulk-storage dataset tree."""
-    stage = preset if preset else "custom"
-    return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, stage)
-
-
 def resolve_local_data_dir(config: str) -> str:
     """Default staged-data directory for offline/manual chunk training."""
     return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, "source")
@@ -191,7 +175,7 @@ def parse_args():
     Presets set defaults for architecture and training params, but any
     explicitly passed CLI flag takes priority over the preset value.
     """
-    p = argparse.ArgumentParser(description="Full-streaming GPT trainer on FineWeb-Edu")
+    p = argparse.ArgumentParser(description="GPT trainer on FineWeb-Edu")
 
     # Dataset config: which CommonCrawl snapshot to train on.
     p.add_argument(
@@ -249,18 +233,6 @@ def parse_args():
     p.add_argument("--preset", choices=["125m", "350m", "760m", "1.3b"],
                    help="Apply a size-based training preset (tuned for multi-GPU runs; override any field via CLI flags)")
 
-    # Data loading modes (mutually exclusive in practice):
-    #   --stream: Pure network streaming, no local storage needed.
-    #   --cache-gb N: Rolling cache -- downloads N GB, trains, deletes, repeats.
-    #   (default): Loads full config into HF cache. NOT full 10TB dataset --
-    #              just the selected CommonCrawl snapshot config.
-    p.add_argument("--stream", action="store_true", default=False,
-                   help="Use HF streaming mode (slower, no pre-download needed)")
-    p.add_argument("--cache-gb", type=float, default=0,
-                   help="Rolling cache size in GB. Downloads this much data, trains on it, "
-                        "deletes, and downloads the next chunk. (0 = use full config download)")
-    p.add_argument("--cache-dir", type=str, default=".data_cache",
-                   help="Directory for rolling cache parquet files")
     p.add_argument("--offline", action="store_true", default=False,
                    help="Disable HuggingFace network access and use only staged local parquet")
     p.add_argument("--local-data-dir", action="append", default=None,
@@ -336,10 +308,6 @@ def parse_args():
     # Default tokenizer path inside out_dir (unless user explicitly set it).
     if "--tokenizer-model" not in explicit_flags:
         args.tokenizer_model = os.path.join(args.out_dir, "tokenizer.model")
-
-    # Default cache dir inside out_dir (unless user explicitly set it).
-    if "--cache-dir" not in explicit_flags:
-        args.cache_dir = default_cache_dir(args.config, args.preset)
 
     if args.local_data_dir is not None:
         args.local_data_dir = [os.path.abspath(path) for path in args.local_data_dir]
@@ -454,8 +422,7 @@ def ensure_tokenizer(args, is_main=True):
     """Load or build a SentencePiece BPE tokenizer.
 
     If the tokenizer .model file exists, loads it directly. Otherwise,
-    builds from staged local parquet or streams seed_docs documents from
-    HuggingFace to build a new tokenizer.
+    builds from staged local parquet.
     In distributed training, only rank 0 builds; other ranks wait at barrier.
     """
     tok_model = args.tokenizer_model
@@ -477,7 +444,7 @@ def ensure_tokenizer(args, is_main=True):
 
     local_parquet_files = discover_local_parquet_files(args.local_data_dir, required=False)
 
-    # Build tokenizer from local staged data or streamed data (rank 0 only).
+    # Build tokenizer from local staged data (rank 0 only).
     if is_main:
         os.makedirs(os.path.dirname(os.path.abspath(tok_model)) or ".", exist_ok=True)
         fd, seed_path = tempfile.mkstemp(
@@ -495,21 +462,12 @@ def ensure_tokenizer(args, is_main=True):
                     f"in staged local parquet: {args.local_data_dir}"
                 )
                 wrote_seed = write_tokenizer_seed_from_parquet(seed_path, local_parquet_files, args.seed_docs)
-            elif args.offline:
+            else:
                 raise RuntimeError(
-                    "Tokenizer missing and offline mode is enabled.\n"
+                    "Tokenizer missing and no staged parquet was provided.\n"
                     f"Expected tokenizer at: {tok_model}\n"
                     f"Expected staged parquet under: {format_local_data_dirs(args.local_data_dir or [resolve_local_data_dir(args.config)])}"
                 )
-            else:
-                print(f"Tokenizer missing. Building from first {args.seed_docs:,} streamed docs...")
-                ds = load_dataset(HF_DATASET, args.config, split="train", streaming=True)
-                with open(seed_path, "w", encoding="utf-8") as f:
-                    for ex in itertools.islice(ds, args.seed_docs):
-                        t = (ex.get("text") or "").strip()
-                        if t:
-                            f.write(t + "\n")
-                            wrote_seed += 1
 
             if wrote_seed == 0:
                 raise RuntimeError(
@@ -696,442 +654,6 @@ class LocalBatcher:
 
 
 # =============================================================================
-# Data Loading: Streaming Batcher
-# =============================================================================
-
-class _SharedDocIterator:
-    """Thread-safe iterator over an HF streaming dataset.
-
-    Multiple worker threads share a single dataset iterator. The lock
-    ensures only one thread advances the iterator at a time.
-    """
-
-    def __init__(self, config, rank=0, world_size=1):
-        ds = load_dataset(HF_DATASET, config, split="train", streaming=True)
-        if world_size > 1:
-            try:
-                from datasets.distributed import split_dataset_by_node
-                ds = split_dataset_by_node(ds, rank=rank, world_size=world_size)
-            except ImportError:
-                # Fallback: manual strided iteration.
-                ds = itertools.islice(ds, rank, None, world_size)
-        self._it = iter(ds)
-        self._lock = threading.Lock()
-
-    def __next__(self):
-        with self._lock:
-            return next(self._it)
-
-
-class StreamingBatcher:
-    """Network-streaming batcher for training without any local storage.
-
-    Streams documents directly from HuggingFace Hub. Slower than local
-    loading due to network latency, but requires zero disk space.
-    """
-
-    def __init__(self, sp, config, context, batch_size, queue_size=64,
-                 num_workers=2, rank=0, world_size=1):
-        self.sp = sp
-        self.eos_id = sp.eos_id()
-        self.context = context
-        self.batch_size = batch_size
-        self.q = queue.Queue(maxsize=queue_size)
-        self.stop = threading.Event()
-        self.num_workers = max(1, num_workers)
-        self._shared_docs = _SharedDocIterator(config, rank=rank, world_size=world_size)
-
-        self.workers = []
-        for _ in range(self.num_workers):
-            w = threading.Thread(target=self._run, daemon=True)
-            w.start()
-            self.workers.append(w)
-
-    def _should_stop(self):
-        return self.stop.is_set() or _shutdown.is_set()
-
-    def _run(self):
-        """Worker thread: stream, tokenize, and pack into batches."""
-        token_buf = deque()
-        needed = self.batch_size * (self.context + 1)
-
-        while not self._should_stop():
-            try:
-                ex = next(self._shared_docs)
-            except StopIteration:
-                break  # Dataset exhausted.
-
-            txt = (ex.get("text") or "").strip()
-            if not txt:
-                continue
-            ids = self.sp.encode(txt, out_type=int)
-            if ids:
-                token_buf.extend(ids)
-                token_buf.append(self.eos_id)
-
-            while len(token_buf) >= needed and not self._should_stop():
-                block = list(itertools.islice(token_buf, needed))
-                for _ in range(needed):
-                    token_buf.popleft()
-                t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
-                x = t[:, :-1].contiguous()
-                y = t[:, 1:].contiguous()
-                while not self._should_stop():
-                    try:
-                        self.q.put((x, y), timeout=1.0)
-                        break
-                    except queue.Full:
-                        continue
-
-    def next(self, device):
-        """Get next batch, moving to device."""
-        x, y = self.q.get(timeout=120)
-        if str(device).startswith("cuda"):
-            x = x.pin_memory().to(device, non_blocking=True)
-            y = y.pin_memory().to(device, non_blocking=True)
-        else:
-            x, y = x.to(device), y.to(device)
-        return x, y
-
-    def close(self):
-        self.stop.set()
-
-
-# =============================================================================
-# Data Loading: Rolling Cache
-# =============================================================================
-# Downloads N GB of parquet shards -> trains on them -> deletes -> downloads
-# the next batch of shards. This way you never need the full dataset on disk.
-
-def _list_parquet_urls(config):
-    """List all parquet file URLs for a FineWeb-Edu config via HF Hub API.
-
-    Uses HfApi.list_repo_tree() to discover shard files. We never guess
-    shard names because HuggingFace naming conventions vary by dataset.
-    """
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi()
-        files = api.list_repo_tree(HF_DATASET, repo_type="dataset", path_in_repo=f"data/{config}")
-        urls = []
-        for f in files:
-            if hasattr(f, "rfilename") and f.rfilename.endswith(".parquet"):
-                urls.append(f.rfilename)
-        urls.sort()
-        if not urls:
-            raise RuntimeError(
-                f"No parquet files found for config '{config}' in {HF_DATASET}. "
-                f"Check that the config name is correct and you have network access."
-            )
-        return urls
-    except ImportError:
-        raise RuntimeError(
-            "huggingface_hub is required for --cache-gb mode. "
-            "Install with: pip install huggingface_hub"
-        )
-
-
-def _load_cache_state(state_path):
-    """Load rolling cache progress state from disk."""
-    if os.path.exists(state_path):
-        with open(state_path) as f:
-            state = json.load(f)
-        state.setdefault("current_shard_idx", 0)
-        state.setdefault("next_shard_idx", 0)
-        state.setdefault("total_shards_trained", 0)
-        return state
-    return {"current_shard_idx": 0, "next_shard_idx": 0, "total_shards_trained": 0}
-
-
-def _save_cache_state(state_path, state):
-    """Persist rolling cache progress (atomic write via tmp + replace)."""
-    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
-    tmp_path = state_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp_path, state_path)
-
-
-def _download_shard_batch(shard_paths, cache_dir, max_bytes, is_main=True):
-    """Download parquet shards into cache_dir up to max_bytes total size."""
-    from huggingface_hub import hf_hub_download
-
-    os.makedirs(cache_dir, exist_ok=True)
-    downloaded = []
-    total_bytes = 0
-
-    for shard_path in shard_paths:
-        if total_bytes >= max_bytes:
-            break
-        try:
-            local_path = hf_hub_download(
-                repo_id=HF_DATASET,
-                filename=shard_path,
-                repo_type="dataset",
-                local_dir=cache_dir,
-                local_dir_use_symlinks=False,
-            )
-            fsize = os.path.getsize(local_path)
-            total_bytes += fsize
-            downloaded.append(local_path)
-            if is_main:
-                print(f"  cached: {shard_path} ({fsize / 1e9:.2f} GB, total: {total_bytes / 1e9:.2f} GB)")
-        except Exception as e:
-            if is_main:
-                print(f"  skip: {shard_path} ({e})")
-            continue
-
-    return downloaded
-
-
-def _clear_cache_data(cache_dir, is_main=True):
-    """Delete parquet data files but preserve metadata (state, shard list)."""
-    preserve = {"_shard_list.json", "_chunk_count.json"}
-    if not os.path.exists(cache_dir):
-        return
-    for entry in os.listdir(cache_dir):
-        if entry in preserve:
-            continue
-        path = os.path.join(cache_dir, entry)
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.remove(path)
-        except OSError as e:
-            if is_main:
-                print(f"  warning: could not remove {path}: {e}")
-    if is_main:
-        print(f"cache: cleared data in {cache_dir}")
-
-
-class RollingCacheBatcher:
-    """Downloads data in chunks, trains on each chunk, then rotates.
-
-    Wraps LocalBatcher internally. The training loop calls should_rotate()
-    which uses an all-reduce so all DDP ranks agree on when to rotate.
-
-    Chunk lifecycle:
-      1. Download N GB of parquet shards from HuggingFace Hub.
-      2. Load into a LocalBatcher for high-throughput training.
-      3. When all docs in the chunk have been seen (1 epoch), rotate:
-         save checkpoint, delete old data, download next batch.
-      4. Repeat until all shards consumed, then wrap to beginning.
-    """
-
-    def __init__(self, sp, args, *, rank=0, world_size=1, is_main=False, is_val=False):
-        self.sp = sp
-        self.args = args
-        self.rank = rank
-        self.world_size = world_size
-        self.is_main = is_main
-        self.is_val = is_val
-        self.is_distributed = dist.is_initialized()
-        self.cache_dir = args.cache_dir
-        self.max_bytes = int(args.cache_gb * 1e9)
-
-        # State file lives outside cache_dir so it survives cache clears.
-        self.state_path = os.path.join(
-            os.path.dirname(self.cache_dir) or ".",
-            f".{os.path.basename(self.cache_dir)}_state.json",
-        )
-
-        # Validation uses fewer workers/queue to save resources.
-        if is_val:
-            self.qsize = max(16, args.queue_size // 2)
-            self.nw = max(1, args.num_workers // 2)
-        else:
-            self.qsize = args.queue_size
-            self.nw = args.num_workers
-
-        # Rank 0 discovers all available shards and broadcasts the list.
-        if is_main:
-            self._all_shards = _list_parquet_urls(args.config)
-            shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
-            os.makedirs(self.cache_dir, exist_ok=True)
-            with open(shard_list_path, "w") as f:
-                json.dump(self._all_shards, f)
-            print(f"cache: found {len(self._all_shards)} parquet shards for {args.config}")
-
-        if self.is_distributed:
-            dist.barrier()
-
-        if not is_main:
-            shard_list_path = os.path.join(self.cache_dir, "_shard_list.json")
-            with open(shard_list_path) as f:
-                self._all_shards = json.load(f)
-
-        # Load or initialize progress state.
-        self._state = (
-            _load_cache_state(self.state_path)
-            if is_main
-            else {"current_shard_idx": 0, "next_shard_idx": 0, "total_shards_trained": 0}
-        )
-
-        # Broadcast state from rank 0 so all ranks start at the same shard.
-        if self.is_distributed:
-            if is_main:
-                state_bytes = json.dumps(self._state).encode()
-                state_tensor = torch.tensor(list(state_bytes), dtype=torch.uint8).cuda()
-                size_tensor = torch.tensor([len(state_bytes)], dtype=torch.long).cuda()
-                dist.broadcast(size_tensor, src=0)
-                dist.broadcast(state_tensor, src=0)
-            else:
-                size_tensor = torch.tensor([0], dtype=torch.long).cuda()
-                dist.broadcast(size_tensor, src=0)
-                state_tensor = torch.zeros(size_tensor.item(), dtype=torch.uint8).cuda()
-                dist.broadcast(state_tensor, src=0)
-                self._state = json.loads(bytes(state_tensor.tolist()).decode())
-
-        self._inner = None
-        self._val_ds = None  # Held-out validation slice from first chunk.
-        initial_idx = self._initial_chunk_start()
-        self._load_next_chunk(start_idx=initial_idx)
-
-    def _initial_chunk_start(self):
-        """Recover the currently active chunk start from persisted state."""
-        current_idx = int(self._state.get("current_shard_idx", 0))
-        next_idx = int(self._state.get("next_shard_idx", 0))
-        if current_idx or next_idx == 0:
-            return current_idx
-
-        count_path = os.path.join(self.cache_dir, "_chunk_count.json")
-        if os.path.exists(count_path):
-            with open(count_path) as f:
-                info = json.load(f)
-            inferred = max(0, int(info.get("next_idx", next_idx)) - int(info.get("n_shards", 0)))
-            self._state["current_shard_idx"] = inferred
-            self._state["next_shard_idx"] = int(info.get("next_idx", next_idx))
-            if self.is_main:
-                _save_cache_state(self.state_path, self._state)
-            return inferred
-        return current_idx
-
-    def _load_next_chunk(self, start_idx=None, expected_next_idx=None, count_as_trained=True):
-        """Download a shard chunk and create a new LocalBatcher."""
-        if self._inner is not None:
-            self._inner.close()
-            self._inner = None
-
-        idx = self._state["next_shard_idx"] if start_idx is None else int(start_idx)
-        remaining = self._all_shards[idx:]
-
-        # Wrap around if all shards consumed.
-        if not remaining:
-            if self.is_main:
-                print("cache: all shards consumed. Wrapping to beginning.")
-            self._state["next_shard_idx"] = 0
-            remaining = self._all_shards
-            idx = 0
-
-        # Rank 0 downloads; other ranks wait at barrier.
-        if self.is_main:
-            _clear_cache_data(self.cache_dir, is_main=True)
-            downloaded = _download_shard_batch(remaining, self.cache_dir, self.max_bytes, is_main=True)
-            n_downloaded = len(downloaded)
-            print(f"cache: downloaded {n_downloaded} shards into {self.cache_dir}")
-
-            self._state["current_shard_idx"] = idx
-            self._state["next_shard_idx"] = (
-                int(expected_next_idx) if expected_next_idx is not None else idx + n_downloaded
-            )
-            if count_as_trained:
-                self._state["total_shards_trained"] = self._state.get("total_shards_trained", 0) + n_downloaded
-            _save_cache_state(self.state_path, self._state)
-
-            count_path = os.path.join(self.cache_dir, "_chunk_count.json")
-            with open(count_path, "w") as f:
-                json.dump({"n_shards": n_downloaded, "next_idx": self._state["next_shard_idx"]}, f)
-
-        if self.is_distributed:
-            dist.barrier()
-
-        # All ranks: load parquet files into an Arrow-backed Dataset.
-        parquet_files = sorted(glob.glob(os.path.join(self.cache_dir, "**", "*.parquet"), recursive=True))
-        if not parquet_files:
-            raise RuntimeError(f"No parquet files found in {self.cache_dir} after download")
-
-        if self.is_main:
-            print(f"cache: loading {len(parquet_files)} parquet files as local dataset...")
-
-        from datasets import Dataset
-        tables = [pq.read_table(f, columns=["text"]) for f in parquet_files]
-        combined = pa.concat_tables(tables)
-        ds = Dataset(combined)
-
-        if self.is_main:
-            print(f"cache: chunk loaded -- {len(ds):,} documents")
-
-        # Sync shard index on non-main ranks.
-        if not self.is_main:
-            count_path = os.path.join(self.cache_dir, "_chunk_count.json")
-            if os.path.exists(count_path):
-                with open(count_path) as f:
-                    info = json.load(f)
-                    self._state["current_shard_idx"] = max(
-                        0, int(info["next_idx"]) - int(info["n_shards"])
-                    )
-                    self._state["next_shard_idx"] = info["next_idx"]
-
-        # Reserve 1% (min 100 docs) as validation set from first chunk only.
-        if self._val_ds is None:
-            n_val = max(100, len(ds) // 100)
-            self._val_ds = ds.select(range(len(ds) - n_val, len(ds)))
-            ds = ds.select(range(len(ds) - n_val))
-            if self.is_main:
-                print(f"cache: reserved {n_val:,} docs for validation, {len(ds):,} for training")
-
-        self._inner = LocalBatcher(
-            self.sp, ds, self.args.context, self.args.batch_size,
-            queue_size=self.qsize, num_workers=self.nw,
-            rank=self.rank, world_size=self.world_size,
-            seed=self.args.seed,
-        )
-        self._chunk_docs = len(ds)
-
-    def should_rotate(self):
-        """Check if all ranks have completed at least 1 epoch on current chunk.
-
-        Uses all_reduce(MIN) so rotation only happens when ALL ranks are ready.
-        """
-        local_flag = 1 if (self._inner is not None and self._inner.epochs_completed >= 1) else 0
-        if self.is_distributed:
-            flag_tensor = torch.tensor([local_flag], dtype=torch.int32, device="cuda")
-            dist.all_reduce(flag_tensor, op=dist.ReduceOp.MIN)
-            return flag_tensor.item() >= 1
-        return local_flag >= 1
-
-    def get_val_dataset(self):
-        """Return the held-out validation dataset."""
-        return self._val_ds
-
-    def load_next_chunk(self):
-        """Externally trigger chunk rotation."""
-        self._load_next_chunk()
-
-    def restore_position(self, current_idx, next_idx):
-        """Reload the chunk described by a checkpointed rolling-cache position."""
-        self._state["current_shard_idx"] = int(current_idx)
-        self._state["next_shard_idx"] = int(next_idx)
-        if self.is_main:
-            _save_cache_state(self.state_path, self._state)
-        if self.is_distributed:
-            dist.barrier()
-        self._load_next_chunk(
-            start_idx=current_idx,
-            expected_next_idx=next_idx,
-            count_as_trained=False,
-        )
-
-    def next(self, device):
-        return self._inner.next(device)
-
-    def close(self):
-        if self._inner is not None:
-            self._inner.close()
-
-
-# =============================================================================
 # Batcher Factory
 # =============================================================================
 
@@ -1140,9 +662,7 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
 
     Priority:
       1. --local-data-dir: staged local parquet (offline/manual chunks).
-      2. --stream: Network streaming (no disk needed).
-      3. --cache-gb N: Rolling cache (N GB at a time).
-      4. Default: Load full config into HF local cache (fastest).
+      2. Default: Load full config into HF local cache (fastest for networked environments).
     """
     if args.local_data_dir:
         qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
@@ -1189,27 +709,6 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
             queue_size=qsize, num_workers=nw,
             rank=rank, world_size=world_size,
             seed=args.seed,
-        )
-
-    if args.stream:
-        if is_main and not is_val:
-            print("data: streaming from HuggingFace Hub")
-        qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
-        nw = max(1, args.num_workers // 2) if is_val else args.num_workers
-        return StreamingBatcher(
-            sp, args.config, args.context, args.batch_size,
-            queue_size=qsize, num_workers=nw,
-            rank=rank, world_size=world_size,
-        )
-
-    if args.cache_gb > 0:
-        if is_val:
-            return None  # Val batcher created from cache's held-out set.
-        if is_main:
-            print(f"data: rolling cache mode ({args.cache_gb} GB per chunk)")
-        return RollingCacheBatcher(
-            sp, args, rank=rank, world_size=world_size,
-            is_main=is_main, is_val=False,
         )
 
     # Default: load the selected config into HF's local Arrow cache.
@@ -1269,18 +768,6 @@ def main():
         raise ValueError(
             "--offline requires --local-data-dir pointing at staged parquet files."
         )
-    if args.offline and args.stream:
-        raise ValueError("--offline cannot be combined with --stream.")
-    if args.offline and args.cache_gb > 0:
-        raise ValueError(
-            "--offline manual chunk training uses --local-data-dir directly. "
-            "Chunking is handled by download_fineweb_snapshot.py, so omit --cache-gb."
-        )
-    if args.local_data_dir and args.cache_gb > 0:
-        raise ValueError(
-            "--local-data-dir already points at the staged chunk to train. "
-            "Do not combine it with --cache-gb."
-        )
 
     # --- Distributed training setup ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1331,41 +818,10 @@ def main():
         sp, args, rank=rank, world_size=world_size,
         is_main=is_main, is_val=False,
     )
-
-    # For rolling cache mode, validation uses held-out docs from the cache
-    # chunk instead of a separate data stream.
-    is_rolling = isinstance(train_batcher, RollingCacheBatcher)
-    if is_rolling:
-        val_ds = train_batcher.get_val_dataset()
-        if val_ds is not None and len(val_ds) > 0:
-            val_batcher = LocalBatcher(
-                sp, val_ds, args.context, args.batch_size,
-                queue_size=max(16, args.queue_size // 4),
-                num_workers=max(1, args.num_workers // 4),
-                rank=rank, world_size=world_size,
-                seed=args.seed + 9999,
-            )
-            if is_main:
-                print(f"data(val): using {len(val_ds):,} held-out docs from cache chunk")
-        else:
-            if args.offline:
-                raise RuntimeError(
-                    "Offline mode requested but no held-out validation data was available from the current local data."
-                )
-            # Fallback: stream validation data if no held-out set available.
-            val_batcher = StreamingBatcher(
-                sp, args.config, args.context, args.batch_size,
-                queue_size=max(16, args.queue_size // 4),
-                num_workers=max(1, args.num_workers // 4),
-                rank=rank, world_size=world_size,
-            )
-            if is_main:
-                print("data(val): fallback to streaming (no held-out set)")
-    else:
-        val_batcher = make_batcher(
-            sp, args, rank=rank, world_size=world_size,
-            is_main=is_main, is_val=True,
-        )
+    val_batcher = make_batcher(
+        sp, args, rank=rank, world_size=world_size,
+        is_main=is_main, is_val=True,
+    )
 
     # --- Model ---
     model = GPT(
@@ -1450,15 +906,6 @@ def main():
             scaler.load_state_dict(_ckpt["scaler_state_dict"])
             if is_main:
                 print("Restored scaler state")
-        if is_rolling and "cache_next_shard_idx" in _ckpt:
-            cache_current = int(_ckpt.get("cache_current_shard_idx", train_batcher._state.get("current_shard_idx", 0)))
-            cache_next = int(_ckpt["cache_next_shard_idx"])
-            active_current = int(train_batcher._state.get("current_shard_idx", 0))
-            active_next = int(train_batcher._state.get("next_shard_idx", 0))
-            if (active_current, active_next) != (cache_current, cache_next):
-                train_batcher.restore_position(cache_current, cache_next)
-            if is_main:
-                print(f"Restored cache shard range: [{cache_current}, {cache_next})")
         del _ckpt  # Free checkpoint memory.
 
     # --- Learning rate schedule ---
@@ -1500,10 +947,6 @@ def main():
 
     if args.local_data_dir:
         data_mode = "local-staged"
-    elif args.cache_gb > 0:
-        data_mode = f"rolling-cache({args.cache_gb}GB)"
-    elif args.stream:
-        data_mode = "streaming"
     else:
         data_mode = "local"
 
@@ -1534,9 +977,6 @@ def main():
             "step": step,
             "tokenizer_fingerprint": current_tok_fp,
         }
-        if is_rolling:
-            ckpt_data["cache_current_shard_idx"] = train_batcher._state.get("current_shard_idx", 0)
-            ckpt_data["cache_next_shard_idx"] = train_batcher._state.get("next_shard_idx", 0)
         tmp_path = path + ".tmp"
         torch.save(ckpt_data, tmp_path)
         os.replace(tmp_path, path)
@@ -1544,7 +984,6 @@ def main():
     ckpt_path = os.path.join(args.out_dir, "fineweb_gpt.ckpt")
     start_time = time.perf_counter()
     last_step_dt = 0.0
-    chunk_step_start = start_step
     last_completed_step = start_step - 1
     final_checkpoint_saved = False
 
@@ -1589,28 +1028,6 @@ def main():
                     if dist.is_initialized():
                         dist.barrier()
                     break
-
-            # Rolling cache: check if we need to rotate to next data chunk.
-            # All ranks agree via all_reduce before rotating.
-            if is_rolling and step > chunk_step_start and train_batcher.should_rotate():
-                if is_main:
-                    print(f"cache: rotating to next chunk at step {step}")
-                    save_checkpoint(ckpt_path, step)
-                    print(f"checkpoint -> {ckpt_path} (pre-rotation)")
-                if dist.is_initialized():
-                    dist.barrier()
-                # Increase NCCL timeout during download (may take minutes).
-                old_timeout = None
-                if dist.is_initialized():
-                    nccl_pg = dist.distributed_c10d._get_default_group()
-                    old_timeout = nccl_pg.options._timeout
-                    nccl_pg.options._timeout = timedelta(minutes=30)
-                train_batcher.load_next_chunk()
-                chunk_step_start = step
-                if dist.is_initialized():
-                    dist.barrier()
-                    if old_timeout is not None:
-                        nccl_pg.options._timeout = old_timeout
 
             # --- Periodic evaluation ---
             if step == start_step or step % args.eval_every == 0:

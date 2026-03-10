@@ -266,27 +266,7 @@ python train_fineweb_gpt.py -350M
 - Best throughput once cached.
 - Highest local disk usage.
 
-### B) Streaming mode
-
-```bash
-python train_fineweb_gpt.py -350M --stream
-```
-
-- Reads directly from Hub.
-- Minimal disk requirements.
-- Slower and network dependent.
-
-### C) Rolling cache mode
-
-```bash
-python train_fineweb_gpt.py -350M --cache-gb 5
-```
-
-- Downloads a chunk of parquet data up to `N` GB.
-- Trains through it, rotates chunk, continues.
-- Good middle ground between storage and throughput.
-
-### D) Offline staged chunk mode
+### B) Offline staged chunk mode
 
 ```bash
 python train_fineweb_gpt.py -125M \
@@ -341,7 +321,6 @@ Rank 0 builds tokenizer, then `dist.barrier()` gates other ranks before load.
 If `--offline` is set:
 - missing staged parquet under `--local-data-dir` is a hard error
 - missing tokenizer falls back only to staged local parquet, never to HuggingFace
-- `--stream` and `--cache-gb` are rejected
 
 ---
 
@@ -404,7 +383,6 @@ After the job finishes:
 - `args`
 - `vocab`
 - `step`
-- `cache_next_shard_idx` (when rolling cache is active)
 - tokenizer fingerprint metadata (used for resume safety)
 
 ### Finetuning checkpoint keys
@@ -564,9 +542,6 @@ Stops on:
 | `--num-workers` | 2 | Loader workers |
 | `--seed` | 42 | Random seed |
 | `--preset` | none | `125m`, `350m`, `760m`, `1.3b` |
-| `--stream` | false | Stream from HF |
-| `--cache-gb` | 0 | Rolling cache size |
-| `--cache-dir` | `.data_cache` | Rolling cache directory |
 | `--resume` | none | Resume checkpoint path |
 
 ### Finetuning (`finetune_chat.py`)

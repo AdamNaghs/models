@@ -79,21 +79,13 @@ python train_fineweb_gpt.py -1.3B
 
 ### Data Loading Modes
 
-- **Default**: downloads the full dataset to local cache, then trains from memory-mapped Arrow files. Fastest throughput.
-- **`--stream`**: reads directly from HuggingFace Hub. No disk usage, but slower and network-dependent.
-- **`--cache-gb N`**: rolling cache mode. Downloads N GB of data, trains on it, deletes it, downloads the next chunk. Good for limited disk space.
+- **Default**: downloads the selected config to the HuggingFace local cache, then trains from memory-mapped Arrow files. Fastest throughput on networked machines.
 - **`--offline --local-data-dir PATH`**: trains from a manually staged local parquet chunk. Intended for Star compute nodes with no outbound network access.
 - Repeat `--local-data-dir` to combine multiple predownloaded configs in one offline run.
 
 ```bash
-# Full download (run once, then train)
+# Full config via local HuggingFace cache
 python train_fineweb_gpt.py -350M
-
-# Streaming (no local storage needed)
-python train_fineweb_gpt.py -350M --stream
-
-# Rolling cache (5 GB at a time)
-python train_fineweb_gpt.py -350M --cache-gb 5
 
 # Offline staged chunk (manual downloader workflow)
 python train_fineweb_gpt.py -125M \
@@ -345,7 +337,6 @@ These live under your chosen `OUT_DIR` (default: `runs/<preset>/`).
 ## Notes
 
 - Windows skips `torch.compile` to avoid Triton issues.
-- The tokenizer is built automatically from the first N streamed documents if `<out_dir>/tokenizer.model` doesn't exist.
-- Full-streaming mode avoids downloading the entire FineWeb-Edu corpus to disk.
+- The tokenizer is built automatically from staged local parquet if `<out_dir>/tokenizer.model` doesn't exist; otherwise provide a matching tokenizer explicitly.
 - The chat format uses regular subword tokens (`### User:`, `### Assistant:`) rather than special tokens, so no vocabulary expansion is needed after pretraining.
 - `chat_fineweb_gpt.py` and `finetune_chat.py` auto-resolve `tokenizer.model` from the checkpoint directory unless you override `--tok`.
