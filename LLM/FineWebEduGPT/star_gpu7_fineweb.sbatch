@@ -22,8 +22,9 @@ PRESET="${PRESET:-350m}"
 STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/$PRESET}"
-CONFIGS="${CONFIGS:-CC-MAIN-2025-26}"
+CONFIGS="${CONFIGS:-sample-100BT}"
 LOCAL_DATA_DIRS="${LOCAL_DATA_DIRS:-}"
+KEEP_LOCAL_DATASET_CACHE="${KEEP_LOCAL_DATASET_CACHE:-0}"
 IFS=':' read -r -a CONFIG_LIST <<< "$CONFIGS"
 LOCAL_DIR_ARGS=()
 if [ -n "$LOCAL_DATA_DIRS" ]; then
@@ -56,6 +57,7 @@ echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Configs: $CONFIGS"
 echo "Local staged data dirs: ${LOCAL_DIR_LIST[*]}"
+echo "Keep local dataset cache: $KEEP_LOCAL_DATASET_CACHE"
 
 # =============================================================================
 # Stage 1: Pretraining
@@ -90,4 +92,4 @@ if [ ! -f "$OUT_DIR/fineweb_gpt.ckpt" ]; then
 fi
 
 echo "Chunk training finished."
-echo "Run download_fineweb_snapshot.py again to stage more configs or additional chunks, then resubmit this sbatch."
+echo "Run download_fineweb_snapshot.py again to stage the next chunk for this sample, then resubmit this sbatch."

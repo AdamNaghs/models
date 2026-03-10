@@ -14,19 +14,18 @@ Multi-GPU training via PyTorch DDP (torchrun --nproc_per_node=N).
 Usage examples:
   # Offline staged chunk from shared storage
   torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
-      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/sample-10BT/source \
       --out-dir /fs1/proj/educational_web_data/runs/125m \
       --stop-after-one-epoch
 
-  # Offline across multiple predownloaded configs
+  # Offline across a staged sample chunk
   torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
-      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
-      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source \
       --out-dir /fs1/proj/educational_web_data/runs/125m
 
   # Resume from checkpoint
   torchrun --nproc_per_node=8 train_fineweb_gpt.py -125M --offline \
-      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
+      --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source \
       --resume /fs1/proj/educational_web_data/runs/125m/fineweb_gpt.ckpt \
       --out-dir /fs1/proj/educational_web_data/runs/125m
 """
@@ -44,6 +43,7 @@ import platform
 import queue
 import random
 import signal
+import shutil
 import sys
 import threading
 import time
@@ -138,9 +138,15 @@ PRESETS = {
     },
 }
 
-# HuggingFace dataset identifier. FineWeb-Edu is ~10TB total across all
-# configs. We never download the full dataset -- only individual configs
-# (CommonCrawl snapshots) or staged local parquet chunks.
+SAMPLE_CONFIGS = (
+    "sample-10BT",
+    "sample-100BT",
+    "sample-350BT",
+)
+
+# HuggingFace dataset identifier. FineWeb-Edu is large across all configs.
+# We never download the full dataset -- only individual dataset configs or
+# staged local parquet chunks.
 HF_DATASET = "HuggingFaceFW/fineweb-edu"
 DEFAULT_STORAGE_ROOT = os.environ.get("FINEWEB_STORAGE_ROOT", "/fs1/proj/educational_web_data")
 
@@ -165,6 +171,26 @@ def resolve_local_data_dir(config: str) -> str:
     return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, "source")
 
 
+def resolve_local_dataset_cache_dir(args) -> str | None:
+    """Choose a disposable datasets cache dir for staged local parquet."""
+    if not args.local_data_dir:
+        return None
+
+    override = os.environ.get("LOCAL_DATASET_CACHE_DIR")
+    if override:
+        return os.path.abspath(override)
+
+    job_tag = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
+    scratch_root = os.environ.get("SLURM_TMPDIR") or os.environ.get("TMPDIR")
+    if scratch_root:
+        return os.path.join(os.path.abspath(scratch_root), f"fineweb_local_dataset_cache_{job_tag}")
+    return os.path.join(args.out_dir, f".local_dataset_cache_{job_tag}")
+
+
+def should_keep_local_dataset_cache() -> bool:
+    return os.environ.get("KEEP_LOCAL_DATASET_CACHE", "0").lower() in {"1", "true", "yes"}
+
+
 # =============================================================================
 # Argument Parsing
 # =============================================================================
@@ -177,19 +203,12 @@ def parse_args():
     """
     p = argparse.ArgumentParser(description="GPT trainer on FineWeb-Edu")
 
-    # Dataset config: which CommonCrawl snapshot to train on.
+    # Dataset config: which FineWeb-Edu dataset config to train on.
     p.add_argument(
         "--config",
-        default="CC-MAIN-2025-26",
-        choices=[
-            "CC-MAIN-2025-05",
-            "CC-MAIN-2025-08",
-            "CC-MAIN-2025-13",
-            "CC-MAIN-2025-18",
-            "CC-MAIN-2025-21",
-            "CC-MAIN-2025-26",
-        ],
-        help="CommonCrawl snapshot config from FineWeb-Edu",
+        default="sample-100BT",
+        choices=list(SAMPLE_CONFIGS),
+        help="FineWeb-Edu dataset config",
     )
 
     # Training hyperparameters.
@@ -667,7 +686,7 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
     if args.local_data_dir:
         qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
         nw = max(1, args.num_workers // 2) if is_val else args.num_workers
-        local_cache_dir = os.path.join(args.out_dir, ".local_dataset_cache")
+        local_cache_dir = resolve_local_dataset_cache_dir(args)
 
         ds = None
         if is_main:
@@ -711,9 +730,9 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
             seed=args.seed,
         )
 
-    # Default: load the selected config into HF's local Arrow cache.
-    # This downloads only the selected CommonCrawl snapshot, NOT the
-    # entire 10TB FineWeb-Edu dataset.
+    # Default: load the selected dataset config into HF's local Arrow cache.
+    # This downloads only the selected FineWeb-Edu config, NOT the
+    # entire dataset.
     qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
     nw = max(1, args.num_workers // 2) if is_val else args.num_workers
 
@@ -763,6 +782,8 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
 
     args = parse_args()
+    local_dataset_cache_dir = resolve_local_dataset_cache_dir(args)
+    keep_local_dataset_cache = should_keep_local_dataset_cache()
 
     if args.offline and not args.local_data_dir:
         raise ValueError(
@@ -805,6 +826,12 @@ def main():
     if is_main:
         os.makedirs(args.out_dir, exist_ok=True)
         print(f"out_dir: {args.out_dir}")
+        if local_dataset_cache_dir:
+            print(f"local_dataset_cache: {local_dataset_cache_dir}")
+            if keep_local_dataset_cache:
+                print("local_dataset_cache: KEEP_LOCAL_DATASET_CACHE=1, cache will be retained")
+            else:
+                print("local_dataset_cache: disposable cache, will be auto-cleaned on exit")
     if is_distributed:
         dist.barrier()
 
@@ -1021,7 +1048,7 @@ def main():
                         save_checkpoint(ckpt_path, max(last_completed_step, start_step))
                         print(f"checkpoint -> {ckpt_path} (chunk complete)")
                         print(
-                            "Chunk training finished. Run download_fineweb_snapshot.py again to stage the next chunk, "
+                            "Chunk training finished. Run download_fineweb_snapshot.py again to stage the next chunk for this sample, "
                             "then resubmit with --resume."
                         )
                     final_checkpoint_saved = True
@@ -1110,8 +1137,24 @@ def main():
         train_batcher.close()
         val_batcher.close()
         if is_distributed and dist.is_initialized():
-            dist.barrier()
-            dist.destroy_process_group()
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+        if is_main and local_dataset_cache_dir:
+            if keep_local_dataset_cache:
+                print(f"local_dataset_cache: retained at {local_dataset_cache_dir}")
+            else:
+                try:
+                    shutil.rmtree(local_dataset_cache_dir, ignore_errors=True)
+                    print(f"local_dataset_cache: cleaned {local_dataset_cache_dir}")
+                except Exception as exc:
+                    print(f"local_dataset_cache: cleanup failed for {local_dataset_cache_dir}: {exc}")
+        if is_distributed and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

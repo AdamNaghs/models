@@ -40,7 +40,7 @@ pip install -r requirements.txt
 python smoke_test.py
 ```
 
-By default, pretraining writes artifacts to `/fs1/proj/educational_web_data/runs/<preset>/`, and rolling-cache shards land under `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/<preset>/`. Override the root with `FINEWEB_STORAGE_ROOT` or pass explicit `--out-dir` / `--cache-dir`. Finetuning and chat can auto-discover `tokenizer.model` from the checkpoint directory.
+By default, pretraining writes artifacts to `/fs1/proj/educational_web_data/runs/<preset>/`, and staged local parquet lives under `/fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source/`. Override the root with `FINEWEB_STORAGE_ROOT` or pass explicit `--out-dir`. Finetuning and chat can auto-discover `tokenizer.model` from the checkpoint directory.
 
 Evaluation docs live in [`docs/EVAL.md`](docs/EVAL.md).
 Star HPC usage docs live in [`docs/STAR_HPC.md`](docs/STAR_HPC.md).
@@ -53,10 +53,10 @@ Default run (single GPU, 350M preset):
 python train_fineweb_gpt.py -350M
 ```
 
-Pick a crawl snapshot:
+Pick a FineWeb-Edu sample config:
 
 ```bash
-python train_fineweb_gpt.py -350M --config CC-MAIN-2025-26
+python train_fineweb_gpt.py -350M --config sample-100BT
 ```
 
 ### Size-Based Presets (multi-GPU tuned defaults)
@@ -79,27 +79,26 @@ python train_fineweb_gpt.py -1.3B
 
 ### Data Loading Modes
 
-- **Default**: downloads the selected config to the HuggingFace local cache, then trains from memory-mapped Arrow files. Fastest throughput on networked machines.
+- **Default**: downloads the selected FineWeb-Edu config to the HuggingFace local cache, then trains from memory-mapped Arrow files. Fastest throughput on networked machines.
 - **`--offline --local-data-dir PATH`**: trains from a manually staged local parquet chunk. Intended for Star compute nodes with no outbound network access.
-- Repeat `--local-data-dir` to combine multiple predownloaded configs in one offline run.
+- The preferred Star workflow is one staged sample config at a time. `sample-10BT` is the smoke target, `sample-100BT` is the default serious `1.3b` target.
 
 ```bash
-# Full config via local HuggingFace cache
-python train_fineweb_gpt.py -350M
+# Full sample config via local HuggingFace cache
+python train_fineweb_gpt.py -350M --config sample-100BT
 
 # Offline staged chunk (manual downloader workflow)
 python train_fineweb_gpt.py -125M \
   --offline \
-  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/sample-10BT/source \
   --out-dir /fs1/proj/educational_web_data/runs/125m \
   --stop-after-one-epoch
 
-# Offline across multiple predownloaded configs
-python train_fineweb_gpt.py -125M \
+# Offline staged sample chunk for a serious run
+python train_fineweb_gpt.py -1.3B \
   --offline \
-  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source \
-  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
-  --out-dir /fs1/proj/educational_web_data/runs/125m
+  --local-data-dir /fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source \
+  --out-dir /fs1/proj/educational_web_data/runs/1.3b
 ```
 
 ### Multi-GPU (torchrun)
@@ -118,70 +117,67 @@ python train_fineweb_gpt.py -350M --out-dir "$OUT_DIR" --resume "$OUT_DIR/finewe
 
 ### Star HPC Offline Workflow
 
-Star compute nodes should not download from HuggingFace directly. Use the login node to stage one or more configs:
+Star compute nodes should not download from HuggingFace directly. Use the login node to stage one sample config at a time.
+
+Smoke-test with `sample-10BT`:
 
 ```bash
 cd LLM/FineWebEduGPT
 python download_fineweb_snapshot.py \
-  --config CC-MAIN-2025-21 \
-  --config CC-MAIN-2025-26 \
+  --config sample-10BT \
   --max-gb 500
 ```
 
-This populates one staged `source/` directory per config, for example:
+Serious `1.3b` runs should use `sample-100BT`:
 
-```text
-/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source
-/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+```bash
+cd LLM/FineWebEduGPT
+python download_fineweb_snapshot.py \
+  --config sample-100BT \
+  --max-gb 500
 ```
 
-and advances a downloader state file for each config so later runs grab the following chunk when needed.
+This populates a staged `source/` directory for the selected sample, for example:
+
+```text
+/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source
+```
+
+and advances a downloader state file for that sample so later runs grab the following chunk when needed.
 
 Then submit pretraining:
 
 ```bash
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source \
-sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-21:CC-MAIN-2025-26 \
-  -o /fs1/proj/educational_web_data/logs/fineweb-125m-%j.out \
-  -e /fs1/proj/educational_web_data/logs/fineweb-125m-%j.err \
-  star_gpu7_fineweb_125m.sbatch
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source \
+sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-100BT \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
 ```
 
 The Star sbatch files now:
-- train on the staged local config set you provided
+- train on the staged local sample chunk you provided
 - save or resume from `<out_dir>/fineweb_gpt.ckpt`
-- stop after one full pass over that staged config set
+- stop after one full pass over that staged sample chunk
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
-- use H100-safe `125m` defaults of `--batch-size 8 --grad-accum 16 --no-compile`
+- use H100-safe `1.3b` defaults of `BATCH_SIZE=1`, `GRAD_ACCUM=128`, and `NO_COMPILE=1`
+- auto-clean the disposable local dataset cache unless `KEEP_LOCAL_DATASET_CACHE=1` is set
 
-For a safer first `1.3b` run on `8x H100 80GB`, stage all 6 configs:
-
-```bash
-cd LLM/FineWebEduGPT
-python download_fineweb_snapshot.py \
-  --config CC-MAIN-2025-05 \
-  --config CC-MAIN-2025-08 \
-  --config CC-MAIN-2025-13 \
-  --config CC-MAIN-2025-18 \
-  --config CC-MAIN-2025-21 \
-  --config CC-MAIN-2025-26 \
-  --max-gb 500
-```
-
-Smoke-test `1.3b` first:
+Smoke-test `1.3b` first with `sample-10BT`:
 
 ```bash
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-05/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-08/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-13/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-18/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
-sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-10BT/source
+sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-10BT,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
   star_gpu7_fineweb_1_3b.sbatch
 ```
 
-Then launch the full `1.3b` run:
+Then launch the full `1.3b` run with `sample-100BT`:
 
 ```bash
-sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26 \
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source
+sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-100BT \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
   star_gpu7_fineweb_1_3b.sbatch
@@ -198,12 +194,12 @@ Tokenizer behavior in offline mode:
 - if `<out_dir>/tokenizer.model` already exists, it is reused
 - otherwise the tokenizer is built from the staged local parquet chunk
 
-Required paths for the `125m` preset:
+Required paths for the `1.3b` preset:
 
 ```text
-/fs1/proj/educational_web_data/runs/125m/tokenizer.model
-/fs1/proj/educational_web_data/runs/125m/fineweb_gpt.ckpt
-/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source/**/*.parquet
+/fs1/proj/educational_web_data/runs/1.3b/tokenizer.model
+/fs1/proj/educational_web_data/runs/1.3b/fineweb_gpt.ckpt
+/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source/**/*.parquet
 ```
 
 ## Chat Finetuning
@@ -316,7 +312,7 @@ Contamination scanning:
 python eval/contamination_scan.py \
   --bench hellaswag \
   --bench piqa \
-  --fineweb-config CC-MAIN-2025-26 \
+  --fineweb-config sample-100BT \
   --fineweb-sample-docs 5000 \
   --ckpt-label fineweb-scan
 ```

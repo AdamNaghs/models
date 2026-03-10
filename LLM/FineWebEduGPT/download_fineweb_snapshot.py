@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage the next FineWeb-Edu shard chunk into local shared storage.
+"""Stage the next FineWeb-Edu sample shard chunk into local shared storage.
 
 This script is intended for HPC workflows where compute nodes cannot access
 HuggingFace directly. Run it on a login node with internet access to download
@@ -8,7 +8,7 @@ the next chunk of parquet shards into:
   /fs1/proj/educational_web_data/dataset/fineweb-edu/<config>/source
 
 The script keeps a state file outside each source directory so repeated
-invocations download the next chunk instead of starting over. Multiple configs
+invocations download the next chunk instead of starting over. Sample configs
 can be staged in one command by repeating ``--config``.
 """
 
@@ -24,6 +24,11 @@ from huggingface_hub import HfApi, hf_hub_download
 
 HF_DATASET = "HuggingFaceFW/fineweb-edu"
 DEFAULT_STORAGE_ROOT = os.environ.get("FINEWEB_STORAGE_ROOT", "/fs1/proj/educational_web_data")
+SAMPLE_CONFIGS = (
+    "sample-10BT",
+    "sample-100BT",
+    "sample-350BT",
+)
 
 
 def default_output_dir(config: str) -> str:
@@ -35,19 +40,12 @@ def default_state_path(config: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Download the next staged FineWeb shard chunk")
+    p = argparse.ArgumentParser(description="Download the next staged FineWeb-Edu sample chunk")
     p.add_argument(
         "--config",
         action="append",
-        choices=[
-            "CC-MAIN-2025-05",
-            "CC-MAIN-2025-08",
-            "CC-MAIN-2025-13",
-            "CC-MAIN-2025-18",
-            "CC-MAIN-2025-21",
-            "CC-MAIN-2025-26",
-        ],
-        help="FineWeb-Edu config to stage. Repeat to stage multiple configs.",
+        choices=list(SAMPLE_CONFIGS),
+        help="FineWeb-Edu sample config to stage. Repeat to stage multiple configs.",
     )
     p.add_argument("--max-gb", type=float, default=500.0, help="Approximate chunk size to stage")
     p.add_argument("--output-dir", type=str, default=None, help="Where to place the staged parquet files")
@@ -55,15 +53,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reset", action="store_true", default=False, help="Reset chunk progress to the beginning")
     args = p.parse_args()
     if not args.config:
-        args.config = ["CC-MAIN-2025-26"]
+        args.config = ["sample-100BT"]
     if len(args.config) > 1 and (args.output_dir or args.state_path):
         raise SystemExit("--output-dir and --state-path only support a single --config at a time.")
     return args
 
 
+def config_repo_path(config: str) -> str:
+    if config.startswith("sample-") and config.endswith("BT"):
+        return f"sample/{config.split('-', 1)[1]}"
+    raise RuntimeError(f"Unsupported FineWeb-Edu config: {config}")
+
+
 def list_parquet_shards(config: str) -> list[dict[str, Any]]:
     api = HfApi()
-    files = api.list_repo_tree(HF_DATASET, repo_type="dataset", path_in_repo=f"data/{config}")
+    files = api.list_repo_tree(HF_DATASET, repo_type="dataset", path_in_repo=config_repo_path(config))
     shards = []
     for file_info in files:
         if hasattr(file_info, "rfilename") and file_info.rfilename.endswith(".parquet"):
@@ -299,7 +303,7 @@ def stage_config(config: str, *, max_gb: float, output_dir: str, state_path: str
     print(f"{config}: chunk ready: shard range [{start_idx}, {next_idx})")
     print(f"{config}: state file: {state_path}")
     if next_idx < len(shards):
-        print(f"{config}: run the downloader again later to stage the next chunk.")
+        print(f"{config}: run the downloader again later to stage the next chunk for this sample.")
     else:
         print(f"{config}: this was the final chunk for the selected config.")
     print()
@@ -332,7 +336,7 @@ def main() -> None:
         results.append(result)
 
     print("Next step:")
-    print("  submit the Star sbatch job to train the staged config set")
+    print("  submit the Star sbatch job to train the staged sample chunk")
     staged_dirs = ":".join(result["output_dir"] for result in results)
     print(f"  LOCAL_DATA_DIRS={staged_dirs}")
     print(f"  CONFIGS={':'.join(result['config'] for result in results)}")
