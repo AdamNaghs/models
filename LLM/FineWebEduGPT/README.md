@@ -162,6 +162,46 @@ The Star sbatch files now:
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
 - use H100-safe `125m` defaults of `--batch-size 8 --grad-accum 16 --no-compile`
 
+For a safer first `1.3b` run on `8x H100 80GB`, stage all 6 configs:
+
+```bash
+cd LLM/FineWebEduGPT
+python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-05 \
+  --config CC-MAIN-2025-08 \
+  --config CC-MAIN-2025-13 \
+  --config CC-MAIN-2025-18 \
+  --config CC-MAIN-2025-21 \
+  --config CC-MAIN-2025-26 \
+  --max-gb 500
+```
+
+Smoke-test `1.3b` first:
+
+```bash
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-05/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-08/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-13/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-18/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
+```
+
+Then launch the full `1.3b` run:
+
+```bash
+sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26 \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
+```
+
+The `1.3b` sbatch defaults are now:
+- `BATCH_SIZE=1`
+- `GRAD_ACCUM=128`
+- `NO_COMPILE=1`
+
+That keeps the original `1.3b` global tokens-per-step budget while avoiding the CUDA OOM pattern seen with larger per-GPU batches.
+
 Tokenizer behavior in offline mode:
 - if `<out_dir>/tokenizer.model` already exists, it is reused
 - otherwise the tokenizer is built from the staged local parquet chunk

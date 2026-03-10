@@ -18,6 +18,12 @@ Key directories for the `125m` preset:
 /fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
 ```
 
+Key directory for the `1.3b` preset:
+
+```text
+/fs1/proj/educational_web_data/runs/1.3b
+```
+
 ## One-Time Setup
 
 From the project directory on the Star login node:
@@ -161,6 +167,101 @@ sbatch --qos=long2x --export=ALL,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-M
 ```
 
 Keep using the same `OUT_DIR` so the checkpoint resumes from the previous chunk.
+
+## Safe `1.3b` Workflow
+
+Use this instead of the `125m` path when you want a more meaningful capability signal.
+
+### Step 1: Stage all 6 configs
+
+```bash
+cd ~/edu_web_data/models/LLM/FineWebEduGPT
+source llmvenv/bin/activate
+python download_fineweb_snapshot.py \
+  --config CC-MAIN-2025-05 \
+  --config CC-MAIN-2025-08 \
+  --config CC-MAIN-2025-13 \
+  --config CC-MAIN-2025-18 \
+  --config CC-MAIN-2025-21 \
+  --config CC-MAIN-2025-26 \
+  --max-gb 500
+```
+
+Build the multi-config local-data string once:
+
+```bash
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-05/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-08/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-13/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-18/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+```
+
+### Step 2: Run a short smoke test
+
+This verifies dataset indexing, the first backward pass, and checkpointing before the full run.
+
+```bash
+cd ~/edu_web_data/models/LLM/FineWebEduGPT
+sbatch --qos=long2x \
+  --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
+```
+
+Smoke acceptance:
+- dataset indexing completes
+- first backward pass succeeds
+- no CUDA OOM appears in stderr
+- at least one eval or checkpoint is written
+
+### Step 3: Launch the full `1.3b` run
+
+The Star `1.3b` sbatch now defaults to H100-safe settings:
+- `BATCH_SIZE=1`
+- `GRAD_ACCUM=128`
+- `NO_COMPILE=1`
+
+```bash
+cd ~/edu_web_data/models/LLM/FineWebEduGPT
+sbatch --qos=long2x \
+  --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26 \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
+```
+
+What the sbatch does:
+- trains offline from all 6 staged configs
+- resumes from `/fs1/proj/educational_web_data/runs/1.3b/fineweb_gpt.ckpt` if present
+- stops after one pass over the staged config set if it has not yet reached `train_steps`
+- keeps the original `1.3b` tokens-per-step budget by using `BATCH_SIZE=1` and `GRAD_ACCUM=128`
+
+### Step 4: Monitor the `1.3b` job
+
+Replace `<jobid>` with the job ID printed by `sbatch`.
+
+```bash
+squeue -j <jobid>
+sacct -j <jobid> --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS,ReqMem,AllocTRES
+sstat -j <jobid>.batch --format=JobID,MaxRSS,AveRSS,MaxVMSize,AveVMSize
+tail -f /fs1/proj/educational_web_data/logs/fineweb-1-3b-<jobid>.out
+tail -f /fs1/proj/educational_web_data/logs/fineweb-1-3b-<jobid>.err
+```
+
+### Step 5: Evaluate the pretrained checkpoint
+
+After pretraining finishes, run the same base-model evals used for `125m`:
+
+```bash
+source llmvenv/bin/activate
+OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b
+TOK=$OUT_DIR/tokenizer.model
+CKPT=$OUT_DIR/fineweb_gpt.ckpt
+
+python eval/eval_lm.py --ckpt "$CKPT" --tok "$TOK" --dataset wikitext_valid --limit 128
+python eval/eval_mcq.py --ckpt "$CKPT" --tok "$TOK" --bench hellaswag
+python eval/eval_mcq.py --ckpt "$CKPT" --tok "$TOK" --bench arc_challenge
+```
+
+Use those results to decide whether the `1.3b` base is worth post-training.
 
 ## Useful Commands
 

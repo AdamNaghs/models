@@ -450,32 +450,39 @@ torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --preset 350m --ou
 
 ## 11. SLURM Deployment
 
-`star_gpu7_fineweb.sbatch` runs pretrain -> checkpoint check -> SFT.
+Use [`STAR_HPC.md`](./STAR_HPC.md) for the exact Star operator workflow.
+
+Current Star defaults:
+- `star_gpu7_fineweb_125m.sbatch` uses H100-safe `125m` settings: `BATCH_SIZE=8`, `GRAD_ACCUM=16`, `--no-compile`
+- `star_gpu7_fineweb_1_3b.sbatch` uses H100-safe `1.3b` settings: `BATCH_SIZE=1`, `GRAD_ACCUM=128`, `NO_COMPILE=1`
+- both support offline multi-config training via `CONFIGS` and `LOCAL_DATA_DIRS`
 
 ### Submit
 
 ```bash
-sbatch star_gpu7_fineweb.sbatch
+sbatch --qos=long2x \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
 ```
 
-### Current stage-1 invocation
+### Safe `1.3b` smoke run
 
 ```bash
-OUT_DIR=${OUT_DIR:-runs/350m}
-
-torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py \
-  --preset 350m \
-  --out-dir "$OUT_DIR" \
-  --cache-gb 500 \
-  --num-workers 8 \
-  --queue-size 25
+LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-05/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-08/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-13/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-18/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-21/source:/fs1/proj/educational_web_data/dataset/fineweb-edu/CC-MAIN-2025-26/source
+sbatch --qos=long2x \
+  --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
+  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
+  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
+  star_gpu7_fineweb_1_3b.sbatch
 ```
 
 ### Notes
 
-- Script installs requirements at runtime.
-- It verifies `$OUT_DIR/fineweb_gpt.ckpt` exists before starting SFT.
-- Adjust `#SBATCH` directives for your cluster constraints.
+- The `1.3b` sbatch trains offline over all 6 staged configs by default.
+- It resumes from `/fs1/proj/educational_web_data/runs/1.3b/fineweb_gpt.ckpt` when present.
+- It stops after one full pass over the staged config set if it has not yet reached `train_steps`.
+- Use `TRAIN_STEPS`, `EVAL_EVERY`, `EVAL_ITERS`, and `CKPT_EVERY` as env overrides for smoke runs.
 
 ---
 

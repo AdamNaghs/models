@@ -22,8 +22,15 @@ PRESET="1.3b"
 STORAGE_ROOT="${FINEWEB_STORAGE_ROOT:-/fs1/proj/educational_web_data}"
 LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/1.3b}"
-CONFIGS="${CONFIGS:-CC-MAIN-2025-26}"
+CONFIGS="${CONFIGS:-CC-MAIN-2025-05:CC-MAIN-2025-08:CC-MAIN-2025-13:CC-MAIN-2025-18:CC-MAIN-2025-21:CC-MAIN-2025-26}"
 NPROC="${NPROC:-8}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-128}"
+NO_COMPILE="${NO_COMPILE:-1}"
+TRAIN_STEPS="${TRAIN_STEPS:-}"
+EVAL_EVERY="${EVAL_EVERY:-}"
+EVAL_ITERS="${EVAL_ITERS:-}"
+CKPT_EVERY="${CKPT_EVERY:-}"
 LOCAL_DATA_DIRS="${LOCAL_DATA_DIRS:-}"
 
 IFS=':' read -r -a CONFIG_LIST <<< "$CONFIGS"
@@ -58,6 +65,9 @@ echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Artifacts will be written to: $OUT_DIR"
 echo "Local staged data dirs: ${LOCAL_DIR_LIST[*]}"
+echo "Micro-batch size per GPU: $BATCH_SIZE"
+echo "Gradient accumulation steps: $GRAD_ACCUM"
+echo "torch.compile disabled: $NO_COMPILE"
 
 echo "========== STAGE 1: PRETRAINING =========="
 echo "Start: $(date)"
@@ -67,11 +77,33 @@ TRAIN_ARGS=(
     --config "${CONFIG_LIST[0]}"
     --offline
     --out-dir "$OUT_DIR"
+    --batch-size "$BATCH_SIZE"
+    --grad-accum "$GRAD_ACCUM"
     --num-workers 8
     --queue-size 25
     --stop-after-one-epoch
 )
 TRAIN_ARGS+=("${LOCAL_DIR_ARGS[@]}")
+
+if [ "$NO_COMPILE" = "1" ]; then
+    TRAIN_ARGS+=(--no-compile)
+fi
+
+if [ -n "$TRAIN_STEPS" ]; then
+    TRAIN_ARGS+=(--train-steps "$TRAIN_STEPS")
+fi
+
+if [ -n "$EVAL_EVERY" ]; then
+    TRAIN_ARGS+=(--eval-every "$EVAL_EVERY")
+fi
+
+if [ -n "$EVAL_ITERS" ]; then
+    TRAIN_ARGS+=(--eval-iters "$EVAL_ITERS")
+fi
+
+if [ -n "$CKPT_EVERY" ]; then
+    TRAIN_ARGS+=(--ckpt-every "$CKPT_EVERY")
+fi
 
 if [ -f "$OUT_DIR/fineweb_gpt.ckpt" ]; then
     echo "Resuming pretraining from $OUT_DIR/fineweb_gpt.ckpt"
