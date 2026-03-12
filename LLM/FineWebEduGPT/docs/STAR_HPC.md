@@ -102,6 +102,8 @@ Default `1.3b` Star settings:
 - `GRAD_ACCUM=128`
 - `NO_COMPILE=1`
 - offline staged training streams parquet directly and does not build a second large Arrow cache on disk
+- offline staged training skips the expensive step-0 validation pass by default
+- staged parquet row groups are balanced across ranks by row count before training starts
 
 ### Step 4: Check job status
 
@@ -133,6 +135,12 @@ Quick snapshots:
 tail -n 50 /fs1/proj/educational_web_data/logs/fineweb-1-3b-<jobid>.out
 tail -n 50 /fs1/proj/educational_web_data/logs/fineweb-1-3b-<jobid>.err
 ```
+
+Expected startup behavior for offline staged runs:
+- stdout should report direct parquet streaming and row-balanced rank assignment
+- there is no initial `step 0 | val ...` line before the first training step
+- the first visible training progress should be a later step/eval log, not a long silent pre-eval phase
+- if a rank cannot get batches, the job now fails with a direct staged-parquet batch timeout instead of waiting for a multi-hour NCCL watchdog timeout
 
 ### Step 6: Wait for the stop condition
 

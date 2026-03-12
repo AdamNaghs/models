@@ -408,8 +408,48 @@ def split_parquet_work_items(work_items):
         raise RuntimeError(
             f"Unable to split staged parquet work items into train/val. total_items={total_items}, "
             f"train={len(train_items)}, val={len(val_items)}"
-        )
+    )
     return train_items, val_items
+
+
+def assign_work_items_by_rows(work_items, world_size):
+    """Balance row-group work across ranks by cumulative row count."""
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+
+    assignments = [[] for _ in range(world_size)]
+    rank_row_totals = [0] * world_size
+    ordered_items = sorted(
+        work_items,
+        key=lambda item: (-item["rows"], item["path"], item["row_group"]),
+    )
+    for item in ordered_items:
+        target_rank = min(range(world_size), key=lambda idx: (rank_row_totals[idx], idx))
+        assignments[target_rank].append(item)
+        rank_row_totals[target_rank] += item["rows"]
+
+    for rank_items in assignments:
+        rank_items.sort(key=lambda item: (item["path"], item["row_group"]))
+    return assignments
+
+
+def summarize_row_assignments(assignments):
+    """Return min/max row and item counts for per-rank work assignments."""
+    if not assignments:
+        return {
+            "min_rows": 0,
+            "max_rows": 0,
+            "min_items": 0,
+            "max_items": 0,
+        }
+    row_totals = [sum(item["rows"] for item in rank_items) for rank_items in assignments]
+    item_totals = [len(rank_items) for rank_items in assignments]
+    return {
+        "min_rows": min(row_totals),
+        "max_rows": max(row_totals),
+        "min_items": min(item_totals),
+        "max_items": max(item_totals),
+    }
 
 
 def iter_text_from_work_item(work_item):
@@ -698,14 +738,15 @@ class LocalParquetStreamBatcher:
     def __init__(
         self,
         sp,
-        work_items,
+        assigned_items,
         context,
         batch_size,
         queue_size=256,
         num_workers=4,
+        label="train",
         rank=0,
-        world_size=1,
         seed=42,
+        queue_timeout=120,
     ):
         self.sp = sp
         self.eos_id = sp.eos_id()
@@ -713,12 +754,18 @@ class LocalParquetStreamBatcher:
         self.batch_size = batch_size
         self.q = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
+        self.label = label
         self.rank = rank
-        self.world_size = max(1, world_size)
         self.seed = seed
+        self.queue_timeout = queue_timeout
 
-        self.work_items = list(work_items)
-        self.assigned_items = self.work_items[rank::self.world_size]
+        self.assigned_items = list(assigned_items)
+        self.assigned_item_count = len(self.assigned_items)
+        self.assigned_rows = sum(item["rows"] for item in self.assigned_items)
+        if not self.assigned_items:
+            raise RuntimeError(
+                f"Rank {rank} received no staged parquet work items for {label} loading."
+            )
         self.num_workers = max(1, num_workers)
         self._counter = _AtomicCounter(0)
         self._epoch = 0
@@ -797,7 +844,14 @@ class LocalParquetStreamBatcher:
                             continue
 
     def next(self, device):
-        x, y = self.q.get(timeout=120)
+        try:
+            x, y = self.q.get(timeout=self.queue_timeout)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                f"Timed out waiting for staged parquet {self.label} batch on rank {self.rank}. "
+                f"assigned_items={self.assigned_item_count}, assigned_rows={self.assigned_rows}, "
+                f"queue_timeout={self.queue_timeout}s"
+            ) from exc
         if str(device).startswith("cuda"):
             x = x.pin_memory().to(device, non_blocking=True)
             y = y.pin_memory().to(device, non_blocking=True)
@@ -826,9 +880,15 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
         parquet_files = None
         train_work_items = None
         val_work_items = None
+        train_assignments = None
+        val_assignments = None
         if is_main:
             parquet_files, all_work_items = build_parquet_work_items(args.local_data_dir)
             train_work_items, val_work_items = split_parquet_work_items(all_work_items)
+            train_assignments = assign_work_items_by_rows(train_work_items, world_size)
+            val_assignments = assign_work_items_by_rows(val_work_items, world_size)
+            train_summary = summarize_row_assignments(train_assignments)
+            val_summary = summarize_row_assignments(val_assignments)
             print(
                 f"data: streaming {len(parquet_files)} staged parquet files from "
                 f"{format_local_data_dirs(args.local_data_dir)}"
@@ -837,33 +897,45 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
                 f"data: direct parquet streaming enabled | work_items={len(all_work_items):,} | "
                 f"train={len(train_work_items):,} | val={len(val_work_items):,}"
             )
+            print(
+                "data: row-balanced rank assignment | "
+                f"train_rows_per_rank={train_summary['min_rows']:,}-{train_summary['max_rows']:,} | "
+                f"val_rows_per_rank={val_summary['min_rows']:,}-{val_summary['max_rows']:,} | "
+                f"train_items_per_rank={train_summary['min_items']}-{train_summary['max_items']} | "
+                f"val_items_per_rank={val_summary['min_items']}-{val_summary['max_items']}"
+            )
 
-        work_meta = [parquet_files, train_work_items, val_work_items]
+        work_meta = [parquet_files, train_work_items, val_work_items, train_assignments, val_assignments]
         if dist.is_initialized():
             gathered = [work_meta]
             dist.broadcast_object_list(gathered, src=0)
-            parquet_files, train_work_items, val_work_items = gathered[0]
+            parquet_files, train_work_items, val_work_items, train_assignments, val_assignments = gathered[0]
 
         if not is_main and not dist.is_initialized():
             parquet_files, all_work_items = build_parquet_work_items(args.local_data_dir)
             train_work_items, val_work_items = split_parquet_work_items(all_work_items)
+            train_assignments = assign_work_items_by_rows(train_work_items, world_size)
+            val_assignments = assign_work_items_by_rows(val_work_items, world_size)
 
         selected_items = val_work_items if is_val else train_work_items
         selected_label = "val" if is_val else "train"
+        selected_assignments = val_assignments if is_val else train_assignments
         if len(selected_items) < world_size:
             raise RuntimeError(
                 f"Not enough staged parquet work items for distributed {selected_label} loading. "
                 f"items={len(selected_items)}, world_size={world_size}. Stage a larger chunk or reduce GPUs."
             )
+        assigned_rank_items = selected_assignments[rank]
         if is_main:
             print(
                 f"data({selected_label}): using {len(selected_items):,} staged parquet work items "
                 f"via direct streaming"
             )
         return LocalParquetStreamBatcher(
-            sp, selected_items, args.context, args.batch_size,
+            sp, assigned_rank_items, args.context, args.batch_size,
             queue_size=qsize, num_workers=nw,
-            rank=rank, world_size=world_size,
+            label=selected_label,
+            rank=rank,
             seed=args.seed + 9999 if is_val else args.seed,
         )
 
@@ -1116,6 +1188,8 @@ def main():
         )
         if start_step > 0:
             print(f"Resuming from step {start_step}")
+        if args.local_data_dir:
+            print("Skipping initial eval for offline staged streaming")
 
     # --- Checkpoint saving ---
     def save_checkpoint(path, step):
@@ -1186,7 +1260,12 @@ def main():
                     break
 
             # --- Periodic evaluation ---
-            if step == start_step or step % args.eval_every == 0:
+            should_run_eval = (step % args.eval_every == 0)
+            if step == start_step and args.local_data_dir:
+                should_run_eval = False
+            elif step == start_step:
+                should_run_eval = True
+            if should_run_eval:
                 if is_cuda:
                     torch.cuda.synchronize()
                 eval_start = time.perf_counter()

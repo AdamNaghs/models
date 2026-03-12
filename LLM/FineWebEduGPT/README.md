@@ -162,6 +162,8 @@ The Star sbatch files now:
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
 - use H100-safe `1.3b` defaults of `BATCH_SIZE=1`, `GRAD_ACCUM=128`, and `NO_COMPILE=1`
 - stream staged parquet directly without building a second large on-disk Arrow cache
+- skip the expensive step-0 validation pass for offline staged runs
+- balance staged parquet row groups across ranks by row count before training starts
 
 Smoke-test `1.3b` first with `sample-10BT`:
 

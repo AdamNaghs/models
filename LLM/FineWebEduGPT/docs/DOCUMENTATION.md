@@ -280,6 +280,8 @@ python train_fineweb_gpt.py -125M \
 - Performs no HuggingFace network access when `--offline` is set.
 - Stops after one full pass over the staged chunk so operators can stage the next one manually.
 - The preferred Star workflow is one staged sample config at a time.
+- Skips the expensive step-0 validation pass for staged offline runs.
+- Balances staged parquet row groups across ranks by row count before training starts.
 
 ### Train/Val split behavior
 
