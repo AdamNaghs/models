@@ -362,7 +362,7 @@ The Star sbatch files:
 - resume from `<out_dir>/fineweb_gpt.ckpt` if it already exists
 - stop after one epoch over the staged sample chunk
 - do not launch chat finetuning automatically
-- auto-clean the disposable local dataset cache unless `KEEP_LOCAL_DATASET_CACHE=1`
+- stream staged parquet directly, so no second large Arrow cache is built on disk for offline runs
 
 ### Step 3: Repeat
 
@@ -461,7 +461,7 @@ sbatch --qos=long2x \
 - It resumes from `/fs1/proj/educational_web_data/runs/1.3b/fineweb_gpt.ckpt` when present.
 - It stops after one full pass over the staged sample chunk if it has not yet reached `train_steps`.
 - Use `TRAIN_STEPS`, `EVAL_EVERY`, `EVAL_ITERS`, and `CKPT_EVERY` as env overrides for smoke runs.
-- The derived local dataset cache is disposable and auto-cleaned by default.
+- Offline staged runs stream parquet directly and do not depend on a large derived Arrow cache.
 
 ---
 

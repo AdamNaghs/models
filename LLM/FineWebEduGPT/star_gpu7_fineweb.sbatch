@@ -24,7 +24,6 @@ LOG_DIR="${LOG_DIR:-$STORAGE_ROOT/logs}"
 OUT_DIR="${OUT_DIR:-$STORAGE_ROOT/runs/$PRESET}"
 CONFIGS="${CONFIGS:-sample-100BT}"
 LOCAL_DATA_DIRS="${LOCAL_DATA_DIRS:-}"
-KEEP_LOCAL_DATASET_CACHE="${KEEP_LOCAL_DATASET_CACHE:-0}"
 IFS=':' read -r -a CONFIG_LIST <<< "$CONFIGS"
 LOCAL_DIR_ARGS=()
 if [ -n "$LOCAL_DATA_DIRS" ]; then
@@ -57,7 +56,6 @@ echo "Storage root: $STORAGE_ROOT"
 echo "Log directory: $LOG_DIR"
 echo "Configs: $CONFIGS"
 echo "Local staged data dirs: ${LOCAL_DIR_LIST[*]}"
-echo "Keep local dataset cache: $KEEP_LOCAL_DATASET_CACHE"
 
 # =============================================================================
 # Stage 1: Pretraining

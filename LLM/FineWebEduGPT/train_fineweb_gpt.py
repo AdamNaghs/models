@@ -43,7 +43,6 @@ import platform
 import queue
 import random
 import signal
-import shutil
 import sys
 import threading
 import time
@@ -51,6 +50,7 @@ import tempfile
 from collections import deque
 from contextlib import nullcontext
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import sentencepiece as spm
 import torch
@@ -169,26 +169,6 @@ def default_out_dir(preset: str | None) -> str:
 def resolve_local_data_dir(config: str) -> str:
     """Default staged-data directory for offline/manual chunk training."""
     return os.path.join(DEFAULT_STORAGE_ROOT, "dataset", "fineweb-edu", config, "source")
-
-
-def resolve_local_dataset_cache_dir(args) -> str | None:
-    """Choose a disposable datasets cache dir for staged local parquet."""
-    if not args.local_data_dir:
-        return None
-
-    override = os.environ.get("LOCAL_DATASET_CACHE_DIR")
-    if override:
-        return os.path.abspath(override)
-
-    job_tag = os.environ.get("SLURM_JOB_ID") or f"pid{os.getpid()}"
-    scratch_root = os.environ.get("SLURM_TMPDIR") or os.environ.get("TMPDIR")
-    if scratch_root:
-        return os.path.join(os.path.abspath(scratch_root), f"fineweb_local_dataset_cache_{job_tag}")
-    return os.path.join(args.out_dir, f".local_dataset_cache_{job_tag}")
-
-
-def should_keep_local_dataset_cache() -> bool:
-    return os.environ.get("KEEP_LOCAL_DATASET_CACHE", "0").lower() in {"1", "true", "yes"}
 
 
 # =============================================================================
@@ -391,31 +371,66 @@ def discover_local_parquet_files(local_data_dir, *, required=False):
     return parquet_files
 
 
-def load_local_parquet_dataset(local_data_dir, *, is_main=False, label="data", cache_dir=None):
-    """Load a staged local parquet tree into an Arrow-backed HF Dataset.
-
-    This intentionally goes through the datasets parquet builder instead of
-    eagerly reading every parquet file into memory with pyarrow. That keeps
-    staged local training backed by on-disk Arrow files rather than multiplying
-    the full chunk in RAM on every DDP rank.
-    """
+def build_parquet_work_items(local_data_dir):
+    """Enumerate parquet row-group work items for direct staged-data streaming."""
     parquet_files = discover_local_parquet_files(local_data_dir, required=True)
-    if is_main:
-        print(
-            f"{label}: loading {len(parquet_files)} staged parquet files from "
-            f"{format_local_data_dirs(local_data_dir)}..."
+    work_items = []
+    for parquet_path in parquet_files:
+        pf = pq.ParquetFile(parquet_path)
+        num_row_groups = pf.metadata.num_row_groups
+        for row_group_idx in range(num_row_groups):
+            rows = pf.metadata.row_group(row_group_idx).num_rows
+            work_items.append(
+                {
+                    "path": parquet_path,
+                    "row_group": row_group_idx,
+                    "rows": rows,
+                }
+            )
+    return parquet_files, work_items
+
+
+def split_parquet_work_items(work_items):
+    """Deterministically reserve a tail subset of work items for validation."""
+    if not work_items:
+        raise RuntimeError("No parquet work items discovered from staged local data.")
+
+    total_items = len(work_items)
+    if total_items == 1:
+        raise RuntimeError(
+            "Need at least 2 staged parquet work items to create disjoint train/val splits."
         )
 
-    ds = load_dataset(
-        "parquet",
-        data_files={"train": parquet_files},
-        split="train",
-        cache_dir=cache_dir,
-    )
+    n_val = min(max(100, total_items // 100), total_items - 1)
+    train_items = work_items[:-n_val]
+    val_items = work_items[-n_val:]
+    if not train_items or not val_items:
+        raise RuntimeError(
+            f"Unable to split staged parquet work items into train/val. total_items={total_items}, "
+            f"train={len(train_items)}, val={len(val_items)}"
+        )
+    return train_items, val_items
 
-    if is_main:
-        print(f"{label}: {len(ds):,} documents loaded from staged local parquet")
-    return ds
+
+def iter_text_from_work_item(work_item):
+    """Yield text values from a single parquet row-group work item."""
+    pf = pq.ParquetFile(work_item["path"])
+    batch_iter = pf.iter_batches(
+        columns=["text"],
+        batch_size=512,
+        row_groups=[work_item["row_group"]],
+        use_threads=False,
+    )
+    for batch in batch_iter:
+        column = batch.column(0)
+        if isinstance(column, pa.ChunkedArray):
+            values = column.combine_chunks().to_pylist()
+        else:
+            values = column.to_pylist()
+        for text in values:
+            text = (text or "").strip()
+            if text:
+                yield text
 
 
 def write_tokenizer_seed_from_parquet(seed_path, parquet_files, seed_docs):
@@ -672,6 +687,128 @@ class LocalBatcher:
         self.stop.set()
 
 
+class LocalParquetStreamBatcher:
+    """Stream staged parquet row groups directly without building an Arrow cache.
+
+    Each rank receives a deterministic shard of the global row-group work list.
+    Worker threads stream text batches from local parquet, tokenize on the fly,
+    and pack fixed-length token blocks into the training queue.
+    """
+
+    def __init__(
+        self,
+        sp,
+        work_items,
+        context,
+        batch_size,
+        queue_size=256,
+        num_workers=4,
+        rank=0,
+        world_size=1,
+        seed=42,
+    ):
+        self.sp = sp
+        self.eos_id = sp.eos_id()
+        self.context = context
+        self.batch_size = batch_size
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stop = threading.Event()
+        self.rank = rank
+        self.world_size = max(1, world_size)
+        self.seed = seed
+
+        self.work_items = list(work_items)
+        self.assigned_items = self.work_items[rank::self.world_size]
+        self.num_workers = max(1, num_workers)
+        self._counter = _AtomicCounter(0)
+        self._epoch = 0
+        self._epoch_count = 0
+        self._epoch_lock = threading.Lock()
+        self._epoch_id = 0
+        self._shuffled_items = list(self.assigned_items)
+        random.Random(seed + rank).shuffle(self._shuffled_items)
+
+        self.workers = []
+        for _ in range(self.num_workers):
+            worker = threading.Thread(target=self._run, daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+    def _should_stop(self):
+        return self.stop.is_set() or _shutdown.is_set()
+
+    def _get_next_work_item(self):
+        epoch_id = self._epoch_id
+        pos = self._counter.get_and_increment()
+        if pos < len(self._shuffled_items):
+            return epoch_id, self._shuffled_items[pos]
+        return epoch_id, None
+
+    def _advance_epoch(self, from_epoch_id):
+        with self._epoch_lock:
+            if self._epoch_id != from_epoch_id:
+                return
+            self._epoch += 1
+            self._epoch_count += 1
+            self._epoch_id += 1
+            self._shuffled_items = list(self.assigned_items)
+            random.Random(self.seed + self.rank + self._epoch * 1000).shuffle(self._shuffled_items)
+            self._counter.reset(0)
+
+    @property
+    def epochs_completed(self):
+        return self._epoch_count
+
+    def _run(self):
+        token_buf = deque()
+        needed = self.batch_size * (self.context + 1)
+
+        while not self._should_stop():
+            epoch_id, work_item = self._get_next_work_item()
+            if work_item is None:
+                self._advance_epoch(epoch_id)
+                continue
+
+            if self._epoch_id != epoch_id:
+                continue
+
+            for text in iter_text_from_work_item(work_item):
+                if self._should_stop():
+                    return
+
+                ids = self.sp.encode(text, out_type=int)
+                if not ids:
+                    continue
+                token_buf.extend(ids)
+                token_buf.append(self.eos_id)
+
+                while len(token_buf) >= needed and not self._should_stop():
+                    block = list(itertools.islice(token_buf, needed))
+                    for _ in range(needed):
+                        token_buf.popleft()
+                    t = torch.tensor(block, dtype=torch.long).view(self.batch_size, self.context + 1)
+                    x = t[:, :-1].contiguous()
+                    y = t[:, 1:].contiguous()
+                    while not self._should_stop():
+                        try:
+                            self.q.put((x, y), timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
+
+    def next(self, device):
+        x, y = self.q.get(timeout=120)
+        if str(device).startswith("cuda"):
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
+
+    def close(self):
+        self.stop.set()
+
+
 # =============================================================================
 # Batcher Factory
 # =============================================================================
@@ -686,48 +823,48 @@ def make_batcher(sp, args, *, rank=0, world_size=1, is_main=False, is_val=False)
     if args.local_data_dir:
         qsize = max(16, args.queue_size // 2) if is_val else args.queue_size
         nw = max(1, args.num_workers // 2) if is_val else args.num_workers
-        local_cache_dir = resolve_local_dataset_cache_dir(args)
-
-        ds = None
+        parquet_files = None
+        train_work_items = None
+        val_work_items = None
         if is_main:
-            ds = load_local_parquet_dataset(
-                args.local_data_dir,
-                is_main=True,
-                label="data",
-                cache_dir=local_cache_dir,
+            parquet_files, all_work_items = build_parquet_work_items(args.local_data_dir)
+            train_work_items, val_work_items = split_parquet_work_items(all_work_items)
+            print(
+                f"data: streaming {len(parquet_files)} staged parquet files from "
+                f"{format_local_data_dirs(args.local_data_dir)}"
+            )
+            print(
+                f"data: direct parquet streaming enabled | work_items={len(all_work_items):,} | "
+                f"train={len(train_work_items):,} | val={len(val_work_items):,}"
             )
 
+        work_meta = [parquet_files, train_work_items, val_work_items]
         if dist.is_initialized():
-            dist.barrier()
+            gathered = [work_meta]
+            dist.broadcast_object_list(gathered, src=0)
+            parquet_files, train_work_items, val_work_items = gathered[0]
 
-        if ds is None:
-            ds = load_local_parquet_dataset(
-                args.local_data_dir,
-                is_main=False,
-                label="data",
-                cache_dir=local_cache_dir,
+        if not is_main and not dist.is_initialized():
+            parquet_files, all_work_items = build_parquet_work_items(args.local_data_dir)
+            train_work_items, val_work_items = split_parquet_work_items(all_work_items)
+
+        selected_items = val_work_items if is_val else train_work_items
+        selected_label = "val" if is_val else "train"
+        if len(selected_items) < world_size:
+            raise RuntimeError(
+                f"Not enough staged parquet work items for distributed {selected_label} loading. "
+                f"items={len(selected_items)}, world_size={world_size}. Stage a larger chunk or reduce GPUs."
             )
-
-        n_val = max(100, len(ds) // 100)
-        if is_val:
-            val_ds = ds.select(range(len(ds) - n_val, len(ds)))
-            if is_main:
-                print(f"data(val): using {len(val_ds):,} held-out docs from staged local parquet")
-            return LocalBatcher(
-                sp, val_ds, args.context, args.batch_size,
-                queue_size=qsize, num_workers=nw,
-                rank=rank, world_size=world_size,
-                seed=args.seed + 9999,
-            )
-
-        train_ds = ds.select(range(len(ds) - n_val))
         if is_main:
-            print(f"data(train): {len(train_ds):,} docs from staged local parquet (reserved {n_val:,} for val)")
-        return LocalBatcher(
-            sp, train_ds, args.context, args.batch_size,
+            print(
+                f"data({selected_label}): using {len(selected_items):,} staged parquet work items "
+                f"via direct streaming"
+            )
+        return LocalParquetStreamBatcher(
+            sp, selected_items, args.context, args.batch_size,
             queue_size=qsize, num_workers=nw,
             rank=rank, world_size=world_size,
-            seed=args.seed,
+            seed=args.seed + 9999 if is_val else args.seed,
         )
 
     # Default: load the selected dataset config into HF's local Arrow cache.
@@ -782,8 +919,6 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
 
     args = parse_args()
-    local_dataset_cache_dir = resolve_local_dataset_cache_dir(args)
-    keep_local_dataset_cache = should_keep_local_dataset_cache()
 
     if args.offline and not args.local_data_dir:
         raise ValueError(
@@ -826,12 +961,6 @@ def main():
     if is_main:
         os.makedirs(args.out_dir, exist_ok=True)
         print(f"out_dir: {args.out_dir}")
-        if local_dataset_cache_dir:
-            print(f"local_dataset_cache: {local_dataset_cache_dir}")
-            if keep_local_dataset_cache:
-                print("local_dataset_cache: KEEP_LOCAL_DATASET_CACHE=1, cache will be retained")
-            else:
-                print("local_dataset_cache: disposable cache, will be auto-cleaned on exit")
     if is_distributed:
         dist.barrier()
 
@@ -1141,15 +1270,6 @@ def main():
                 dist.barrier()
             except Exception:
                 pass
-        if is_main and local_dataset_cache_dir:
-            if keep_local_dataset_cache:
-                print(f"local_dataset_cache: retained at {local_dataset_cache_dir}")
-            else:
-                try:
-                    shutil.rmtree(local_dataset_cache_dir, ignore_errors=True)
-                    print(f"local_dataset_cache: cleaned {local_dataset_cache_dir}")
-                except Exception as exc:
-                    print(f"local_dataset_cache: cleanup failed for {local_dataset_cache_dir}: {exc}")
         if is_distributed and dist.is_initialized():
             try:
                 dist.destroy_process_group()

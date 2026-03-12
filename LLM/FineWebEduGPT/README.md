@@ -161,7 +161,7 @@ The Star sbatch files now:
 - stop after one full pass over that staged sample chunk
 - tell you to run `download_fineweb_snapshot.py` again before the next submit
 - use H100-safe `1.3b` defaults of `BATCH_SIZE=1`, `GRAD_ACCUM=128`, and `NO_COMPILE=1`
-- auto-clean the disposable local dataset cache unless `KEEP_LOCAL_DATASET_CACHE=1` is set
+- stream staged parquet directly without building a second large on-disk Arrow cache
 
 Smoke-test `1.3b` first with `sample-10BT`:
 

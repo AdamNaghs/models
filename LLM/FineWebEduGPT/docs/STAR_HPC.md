@@ -101,8 +101,7 @@ Default `1.3b` Star settings:
 - `BATCH_SIZE=1`
 - `GRAD_ACCUM=128`
 - `NO_COMPILE=1`
-- disposable local dataset cache is auto-cleaned on exit
-- set `KEEP_LOCAL_DATASET_CACHE=1` only if you intentionally want to retain the derived Arrow cache for debugging
+- offline staged training streams parquet directly and does not build a second large Arrow cache on disk
 
 ### Step 4: Check job status
 
