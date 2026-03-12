@@ -135,7 +135,7 @@ FineWebEduGPT/
 ├── eval_data/
 │   └── chat_eval_prompts.jsonl # Fixed chat regression prompt suite
 ├── launch_torchrun.sh         # Multi-GPU launcher by preset
-├── star_gpu7_fineweb.sbatch   # Example SLURM pipeline script
+├── star_fineweb.sbatch        # Example SLURM pipeline script
 ├── README.md                  # Quick start
 ├── docs/
 │   ├── DOCUMENTATION.md       # This document
@@ -352,7 +352,7 @@ Run it again after each training job to stage the next chunk for that sample.
 ### Step 2: Submit training
 
 ```bash
-sbatch star_gpu7_fineweb_1_3b.sbatch
+sbatch star_fineweb_1_3b.sbatch
 ```
 
 The Star sbatch files:
@@ -429,8 +429,8 @@ torchrun --standalone --nproc_per_node=8 train_fineweb_gpt.py --preset 350m --ou
 Use [`STAR_HPC.md`](./STAR_HPC.md) for the exact Star operator workflow.
 
 Current Star defaults:
-- `star_gpu7_fineweb_125m.sbatch` uses H100-safe `125m` settings: `BATCH_SIZE=8`, `GRAD_ACCUM=16`, `--no-compile`
-- `star_gpu7_fineweb_1_3b.sbatch` uses H100-safe `1.3b` settings: `BATCH_SIZE=1`, `GRAD_ACCUM=128`, `NO_COMPILE=1`
+- `star_fineweb_125m.sbatch` uses H100-safe `125m` settings: `BATCH_SIZE=8`, `GRAD_ACCUM=16`, `--no-compile`
+- `star_fineweb_1_3b.sbatch` uses H100-safe `1.3b` settings: `BATCH_SIZE=1`, `GRAD_ACCUM=128`, `NO_COMPILE=1`
 - It also hardcodes `sample-100BT`, `/fs1/proj/educational_web_data/runs/1.3b`, and `long2x` for the normal run path.
 - both support offline multi-config training via `CONFIGS` and `LOCAL_DATA_DIRS`
 
@@ -440,7 +440,7 @@ Current Star defaults:
 sbatch --qos=long2x \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+  star_fineweb_1_3b.sbatch
 ```
 
 ### Safe `1.3b` smoke run
@@ -451,7 +451,7 @@ sbatch --qos=long2x \
   --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-10BT,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+  star_fineweb_1_3b.sbatch
 ```
 
 ### Notes

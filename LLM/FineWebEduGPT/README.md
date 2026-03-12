@@ -148,7 +148,7 @@ and advances a downloader state file for that sample so later runs grab the foll
 Then submit pretraining:
 
 ```bash
-sbatch star_gpu7_fineweb_1_3b.sbatch
+sbatch star_fineweb_1_3b.sbatch
 ```
 
 The Star sbatch files now:
@@ -160,7 +160,7 @@ The Star sbatch files now:
 - stream staged parquet directly without building a second large on-disk Arrow cache
 - skip the expensive step-0 validation pass for offline staged runs
 - balance staged parquet row groups across ranks by row count before training starts
-- hardcode `sample-100BT`, `/fs1/proj/educational_web_data/runs/1.3b`, and `long2x` in `star_gpu7_fineweb_1_3b.sbatch`
+- hardcode `sample-100BT`, `/fs1/proj/educational_web_data/runs/1.3b`, and `long2x` in `star_fineweb_1_3b.sbatch`
 
 Smoke-test `1.3b` first with `sample-10BT`:
 
@@ -169,13 +169,13 @@ LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-10BT/s
 sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-10BT,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+  star_fineweb_1_3b.sbatch
 ```
 
 Then launch the full `1.3b` run with `sample-100BT`:
 
 ```bash
-sbatch star_gpu7_fineweb_1_3b.sbatch
+sbatch star_fineweb_1_3b.sbatch
 ```
 
 The `1.3b` sbatch defaults are now:

@@ -76,7 +76,7 @@ sbatch --qos=long2x \
   --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b-smoke,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-10BT,BATCH_SIZE=1,GRAD_ACCUM=32,NO_COMPILE=1,TRAIN_STEPS=20,EVAL_EVERY=10,EVAL_ITERS=2,CKPT_EVERY=20 \
   -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.out \
   -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-smoke-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+  star_fineweb_1_3b.sbatch
 ```
 
 Smoke acceptance:
@@ -89,7 +89,7 @@ Smoke acceptance:
 
 ```bash
 cd ~/edu_web_data/models/LLM/FineWebEduGPT
-sbatch star_gpu7_fineweb_1_3b.sbatch
+sbatch star_fineweb_1_3b.sbatch
 ```
 
 Default `1.3b` Star settings:
@@ -159,7 +159,7 @@ If pretraining is not finished yet:
 
 ```bash
 python download_fineweb_snapshot.py --config sample-100BT --max-gb 500
-sbatch star_gpu7_fineweb_1_3b.sbatch
+sbatch star_fineweb_1_3b.sbatch
 ```
 
 Keep using the same `OUT_DIR` so pretraining resumes from the latest checkpoint.
