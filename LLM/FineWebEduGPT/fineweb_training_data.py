@@ -511,23 +511,24 @@ def _build_offline_stream_batcher(sp, args, *, rank=0, world_size=1, is_main=Fal
         train_work_items, val_work_items = split_parquet_work_items(all_work_items)
         train_assignments = assign_work_items_by_rows(train_work_items, world_size)
         val_assignments = assign_work_items_by_rows(val_work_items, world_size)
-        train_summary = summarize_row_assignments(train_assignments)
-        val_summary = summarize_row_assignments(val_assignments)
-        print(
-            f"data: streaming {len(parquet_files)} staged parquet files from "
-            f"{format_local_data_dirs(args.local_data_dir)}"
-        )
-        print(
-            f"data: direct parquet streaming enabled | work_items={len(all_work_items):,} | "
-            f"train={len(train_work_items):,} | val={len(val_work_items):,}"
-        )
-        print(
-            "data: row-balanced rank assignment | "
-            f"train_rows_per_rank={train_summary['min_rows']:,}-{train_summary['max_rows']:,} | "
-            f"val_rows_per_rank={val_summary['min_rows']:,}-{val_summary['max_rows']:,} | "
-            f"train_items_per_rank={train_summary['min_items']}-{train_summary['max_items']} | "
-            f"val_items_per_rank={val_summary['min_items']}-{val_summary['max_items']}"
-        )
+        if not is_val:
+            train_summary = summarize_row_assignments(train_assignments)
+            val_summary = summarize_row_assignments(val_assignments)
+            print(
+                f"data: streaming {len(parquet_files)} staged parquet files from "
+                f"{format_local_data_dirs(args.local_data_dir)}"
+            )
+            print(
+                f"data: direct parquet streaming enabled | work_items={len(all_work_items):,} | "
+                f"train={len(train_work_items):,} | val={len(val_work_items):,}"
+            )
+            print(
+                "data: row-balanced rank assignment | "
+                f"train_rows_per_rank={train_summary['min_rows']:,}-{train_summary['max_rows']:,} | "
+                f"val_rows_per_rank={val_summary['min_rows']:,}-{val_summary['max_rows']:,} | "
+                f"train_items_per_rank={train_summary['min_items']}-{train_summary['max_items']} | "
+                f"val_items_per_rank={val_summary['min_items']}-{val_summary['max_items']}"
+            )
 
     work_meta = [parquet_files, train_work_items, val_work_items, train_assignments, val_assignments]
     if dist.is_initialized():
