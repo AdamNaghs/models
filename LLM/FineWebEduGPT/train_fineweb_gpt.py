@@ -1217,6 +1217,9 @@ def main():
     ckpt_path = os.path.join(args.out_dir, "fineweb_gpt.ckpt")
     start_time = time.perf_counter()
     last_step_dt = 0.0
+    last_data_wait_dt = 0.0
+    last_compute_dt = 0.0
+    last_opt_dt = 0.0
     last_completed_step = start_step - 1
     final_checkpoint_saved = False
 
@@ -1279,7 +1282,9 @@ def main():
                 if is_main:
                     print(
                         f"step {step:5d} | val {v:.4f} | ppl {math.exp(v):.2f} | "
-                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f} | "
+                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | "
+                        f"data {last_data_wait_dt:.2f}s | compute {last_compute_dt:.2f}s | opt {last_opt_dt:.2f}s | "
+                        f"tok/s {toks_per_s:,.0f} | "
                         f"eval {eval_dt:.2f}s | elapsed {elapsed/60:.1f}m | eta {eta/60:.1f}m"
                     )
                 train_loss_accum = 0.0
@@ -1297,17 +1302,24 @@ def main():
             # Gradient accumulation: sum gradients over micro-steps.
             # Skip DDP all-reduce on non-final micro-steps for efficiency.
             step_loss = 0.0
+            data_wait_dt = 0.0
+            compute_dt = 0.0
             for micro_idx in range(args.grad_accum):
+                data_start = time.perf_counter()
                 xb, yb = train_batcher.next(device)
+                data_wait_dt += time.perf_counter() - data_start
                 ctx = no_sync_ctx() if micro_idx < args.grad_accum - 1 else nullcontext()
+                compute_start = time.perf_counter()
                 with ctx:
                     with torch.amp.autocast("cuda", enabled=is_cuda):
                         _, loss = model(xb, yb)
                         loss = loss / args.grad_accum  # Normalize for accumulation.
                     scaler.scale(loss).backward()
+                compute_dt += time.perf_counter() - compute_start
                 step_loss += loss.item()
 
             # Gradient clipping and optimizer step.
+            opt_start = time.perf_counter()
             scaler.unscale_(opt)
             graded_params = [p for p in model.parameters() if p.grad is not None]
             if graded_params:
@@ -1317,7 +1329,11 @@ def main():
 
             if is_cuda:
                 torch.cuda.synchronize()
+            opt_dt = time.perf_counter() - opt_start
             last_step_dt = time.perf_counter() - step_start
+            last_data_wait_dt = data_wait_dt
+            last_compute_dt = compute_dt
+            last_opt_dt = opt_dt
             last_completed_step = step
 
             # Track training loss for periodic logging.
@@ -1331,7 +1347,9 @@ def main():
                 if is_main:
                     print(
                         f"step {step:5d} | train {avg_train_loss:.4f} | "
-                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | tok/s {toks_per_s:,.0f}"
+                        f"lr {cur_lr:.2e} | dt {last_step_dt:.2f}s | "
+                        f"data {last_data_wait_dt:.2f}s | compute {last_compute_dt:.2f}s | opt {last_opt_dt:.2f}s | "
+                        f"tok/s {toks_per_s:,.0f}"
                     )
 
             # --- Periodic checkpointing ---
