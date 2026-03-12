@@ -352,11 +352,7 @@ Run it again after each training job to stage the next chunk for that sample.
 ### Step 2: Submit training
 
 ```bash
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source
-sbatch --qos=long2x --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-100BT \
-  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
-  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+sbatch star_gpu7_fineweb_1_3b.sbatch
 ```
 
 The Star sbatch files:
@@ -435,6 +431,7 @@ Use [`STAR_HPC.md`](./STAR_HPC.md) for the exact Star operator workflow.
 Current Star defaults:
 - `star_gpu7_fineweb_125m.sbatch` uses H100-safe `125m` settings: `BATCH_SIZE=8`, `GRAD_ACCUM=16`, `--no-compile`
 - `star_gpu7_fineweb_1_3b.sbatch` uses H100-safe `1.3b` settings: `BATCH_SIZE=1`, `GRAD_ACCUM=128`, `NO_COMPILE=1`
+- It also hardcodes `sample-100BT`, `/fs1/proj/educational_web_data/runs/1.3b`, and `long2x` for the normal run path.
 - both support offline multi-config training via `CONFIGS` and `LOCAL_DATA_DIRS`
 
 ### Submit

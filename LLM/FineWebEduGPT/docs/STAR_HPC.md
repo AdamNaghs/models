@@ -89,18 +89,16 @@ Smoke acceptance:
 
 ```bash
 cd ~/edu_web_data/models/LLM/FineWebEduGPT
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source
-sbatch --qos=long2x \
-  --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-100BT \
-  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
-  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+sbatch star_gpu7_fineweb_1_3b.sbatch
 ```
 
 Default `1.3b` Star settings:
 - `BATCH_SIZE=1`
 - `GRAD_ACCUM=128`
 - `NO_COMPILE=1`
+- `CONFIG=sample-100BT`
+- `OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b`
+- `QOS=long2x`
 - offline staged training streams parquet directly and does not build a second large Arrow cache on disk
 - offline staged training skips the expensive step-0 validation pass by default
 - staged parquet row groups are balanced across ranks by row count before training starts
@@ -161,12 +159,7 @@ If pretraining is not finished yet:
 
 ```bash
 python download_fineweb_snapshot.py --config sample-100BT --max-gb 500
-LOCAL_DATA_DIRS=/fs1/proj/educational_web_data/dataset/fineweb-edu/sample-100BT/source
-sbatch --qos=long2x \
-  --export=ALL,OUT_DIR=/fs1/proj/educational_web_data/runs/1.3b,LOCAL_DATA_DIRS="$LOCAL_DATA_DIRS",CONFIGS=sample-100BT \
-  -o /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.out \
-  -e /fs1/proj/educational_web_data/logs/fineweb-1-3b-%j.err \
-  star_gpu7_fineweb_1_3b.sbatch
+sbatch star_gpu7_fineweb_1_3b.sbatch
 ```
 
 Keep using the same `OUT_DIR` so pretraining resumes from the latest checkpoint.

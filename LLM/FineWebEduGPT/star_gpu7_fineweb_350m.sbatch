@@ -3,9 +3,8 @@
 #SBATCH --output=fineweb-350m-%j.out
 #SBATCH --error=fineweb-350m-%j.err
 #SBATCH --nodes=1
-#SBATCH --nodelist=gpu7
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:A100:8
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
 #SBATCH --time=72:00:00
