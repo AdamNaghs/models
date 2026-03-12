@@ -64,8 +64,8 @@ TRAIN_ARGS=(
     --out-dir "$OUT_DIR"
     --batch-size "$BATCH_SIZE"
     --grad-accum "$GRAD_ACCUM"
-    --num-workers 8
-    --queue-size 25
+    --num-workers 16
+    --queue-size 128
     --stop-after-one-epoch
     --local-data-dir "$LOCAL_DATA_DIR"
 )

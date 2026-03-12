@@ -452,14 +452,17 @@ def summarize_row_assignments(assignments):
     }
 
 
+PARQUET_READ_BATCH_SIZE = 4096
+
+
 def iter_text_from_work_item(work_item):
     """Yield text values from a single parquet row-group work item."""
     pf = pq.ParquetFile(work_item["path"])
     batch_iter = pf.iter_batches(
         columns=["text"],
-        batch_size=512,
+        batch_size=PARQUET_READ_BATCH_SIZE,
         row_groups=[work_item["row_group"]],
-        use_threads=False,
+        use_threads=True,
     )
     for batch in batch_iter:
         column = batch.column(0)
@@ -479,7 +482,7 @@ def write_tokenizer_seed_from_parquet(seed_path, parquet_files, seed_docs):
     with open(seed_path, "w", encoding="utf-8") as f:
         for parquet_path in parquet_files:
             pf = pq.ParquetFile(parquet_path)
-            for batch in pf.iter_batches(columns=["text"], batch_size=512):
+            for batch in pf.iter_batches(columns=["text"], batch_size=PARQUET_READ_BATCH_SIZE, use_threads=True):
                 texts = batch.column(0).to_pylist()
                 for text in texts:
                     text = (text or "").strip()
